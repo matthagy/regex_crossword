@@ -6,7 +6,7 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
-                    TypeVar)
+                    TypeVar, FrozenSet, Set)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -98,11 +98,14 @@ class ChrSeq(Sequence['ReChr']):
     chrs: Tuple['ReChr', ...]
 
     def add(self, other: 'ChrSeq') -> 'ChrSeq':
-        if not self.chrs:
-            return other
-        if not other.chrs:
-            return self
-        return chr_seq(self.chrs + other.chrs)
+        offset = len(self)
+
+        def offset_char(chr: ReChr) -> ReChr:
+            if isinstance(chr, ChrRef):
+                return chr.offset(offset)
+            return chr
+
+        return chr_seq(self.chrs + tuple(map(offset_char, other.chrs)))
 
     @overload
     def __getitem__(self, i: int) -> 'ReChr':
@@ -122,7 +125,7 @@ class ChrSeq(Sequence['ReChr']):
         return len(self.chrs)
 
     def __str__(self):
-        return ''.join(map(str, self.chrs))
+        return repr(''.join(map(str, self.chrs)))
 
     def __repr__(self) -> str:
         return f'<CSeq {self!s}>'
@@ -137,21 +140,34 @@ empty_chr_seq = chr_seq(())
 
 
 @dataclass(frozen=True)
-class GroupBindings:
-    bindings: Tuple[ChrSeq, ...] = ()
+class GroupBinding:
+    start: int
+    end: int
 
-    def bind(self, index: int, cs: ChrSeq) -> 'GroupBindings':
+    def offset(self, n: int) -> 'GroupBinding':
+        return GroupBinding(self.start + n, self.end + n)
+
+
+@dataclass(frozen=True)
+class GroupBindings:
+    bindings: Tuple[GroupBinding, ...] = ()
+
+    def bind(self, index: int, cs: GroupBinding) -> 'GroupBindings':
         assert index > 0
         if index - 1 == len(self.bindings):  # appending to end
-            return group_bindings(self.bindings + (cs,))
+            return GroupBindings(self.bindings + (cs,))
         else:  # resetting an existing group in a repeated group
             assert index <= len(self.bindings)
             bs = list(self.bindings)
             bs[index - 1] = cs
-            return group_bindings(tuple(bs))
+            return GroupBindings(tuple(bs))
 
-    def get(self, index: int) -> ChrSeq:
+    def get(self, index: int) -> 'GroupBinding':
         return self.bindings[index - 1]
+
+    def offset(self, n: int) -> 'GroupBindings':
+        assert n >= 0
+        return GroupBindings(tuple(b.offset(n) for b in self.bindings))
 
     def __str__(self):
         return '(' + ', '.join(map(str, self.bindings)) + ')'
@@ -159,34 +175,26 @@ class GroupBindings:
     def __repr__(self) -> str:
         return f'<GBs{self!s}>'
 
-
-@lru_cache(1000)
-def group_bindings(bindings: Tuple[ChrSeq, ...]) -> GroupBindings:
-    return GroupBindings(bindings)
+    def merge(self, other: 'GroupBindings') -> 'GroupBindings':
+        return GroupBindings(self.bindings + other.bindings)
 
 
-empty_group_bindings = group_bindings(())
+empty_group_bindings = GroupBindings(())
 
 
 @dataclass(frozen=True)
 class MatchState:
     groups: GroupBindings = empty_group_bindings
-    bound_anys: Tuple['BoundAny', ...] = ()
 
     def copy(self,
-             groups: Optional[GroupBindings] = None,
-             bound_anys: Optional[Tuple['BoundAny', ...]] = None):
-        return match_state(groups=or_else(groups, self.groups),
-                           bound_anys=or_else(bound_anys, self.bound_anys))
+             groups: Optional[GroupBindings] = None) -> 'MatchState':
+        return MatchState(groups=or_else(groups, self.groups))
+
+    def extend(self, other, offset: int) -> 'MatchState':
+        return self.copy(groups=self.groups.merge(other.groups.offset(offset)))
 
 
-@lru_cache(1000)
-def match_state(groups: GroupBindings = empty_group_bindings,
-                bound_anys: Tuple['BoundAny', ...] = ()) -> MatchState:
-    return MatchState(groups, bound_anys)
-
-
-empty_state = match_state()
+empty_state = MatchState()
 
 
 @dataclass(frozen=True)
@@ -203,8 +211,14 @@ class PossibleMatch:
         return possible_match(chr_seq=or_else(chr_seq, self.chr_seq),
                               state=or_else(state, self.state))
 
+    def extend(self, other: 'PossibleMatch'):
+        n = len(self.chr_seq)
+        if not n:
+            return other
+        return self.copy(chr_seq=self.chr_seq.add(other.chr_seq),
+                         state=self.state.extend(other.state, n))
 
-@lru_cache(1000)
+
 def possible_match(chr_seq: ChrSeq, state: MatchState = empty_state) -> PossibleMatch:
     assert isinstance(state, MatchState)
     return PossibleMatch(chr_seq, state)
@@ -230,18 +244,7 @@ class ReChr(ABC):
     pass
 
 
-@dataclass(frozen=True)
-class BoundAny(ReChr):
-    index: int
-
-    def __str__(self):
-        return f'<{self.index}>'
-
-    def __repr__(self):
-        return f'<BndAny {self.index}>'
-
-
-class ReAny(Re):
+class ReAny(Re, ReChr):
     _instance = None
 
     def __new__(cls) -> Any:
@@ -253,9 +256,7 @@ class ReAny(Re):
         return 1, 1
 
     def gen_possible(self, min_len: int, max_len: int, state: MatchState) -> Iterable[PossibleMatch]:
-        if max_len >= 1:
-            bound = BoundAny(len(state.bound_anys))
-            yield possible_match(chr_seq((bound,)), state=state.copy(bound_anys=state.bound_anys + (bound,)))
+        return [possible_match(chr_seq((self,)), state)] if max_len >= 1 else ()
 
     @classmethod
     def from_op_arg(cls, op, arg, groups) -> 'ReAny':
@@ -329,13 +330,13 @@ Re.op_converters[sre_constants.IN] = ReLit.from_op_arg
 
 
 def extend_matches(re: Re, max_len: int, previous: Iterable[PossibleMatch]) -> Iterable[PossibleMatch]:
-    if max_len <= 0:
+    if max_len < 0:
         return
     for p in previous:
         mx = max_len - len(p.chr_seq)
-        if mx > 0:
+        if mx >= 0:  # repeat can have 0-length matches
             for match in re.gen_possible(0, mx, p.state):
-                yield match.copy(p.chr_seq.add(match.chr_seq))
+                yield p.extend(match)
 
 
 @dataclass(frozen=True)
@@ -365,7 +366,8 @@ class ReSeq(Re):
                     assert s <= max_len
                     if s >= min_len:
                         if self.index is not None:
-                            p = p.copy(state=p.state.copy(p.state.groups.bind(self.index, p.chr_seq)))
+                            p = p.copy(state=p.state.copy(
+                                p.state.groups.bind(self.index, GroupBinding(start=0, end=s))))
                         yield p
             else:
                 yield from rec(index + 1, extend_matches(res[index],
@@ -402,6 +404,28 @@ Re.op_converters[sre_constants.SUBPATTERN] = ReSeq.from_op_arg
 
 
 @dataclass(frozen=True)
+class ChrRef(ReChr):
+    index: int
+    needs_offset: bool = False
+
+    def __str__(self):
+        return f'<{self.index}>'
+
+    def __repr__(self):
+        return f'<ChrRef {self.index}>'
+
+    def offset(self, n: int) -> 'ChrRef':
+        # don't offset first time
+        return ChrRef(self.index if not self.needs_offset else self.index + n, True)
+
+    def __eq__(self, o: object) -> bool:
+        return isinstance(o, ChrRef) and self.index == o.index
+
+    def __hash__(self) -> int:
+        return hash(self.index)
+
+
+@dataclass(frozen=True)
 class ReGroupRef(Re):
     group: ReSeq
 
@@ -409,9 +433,11 @@ class ReGroupRef(Re):
         return self.group.span()
 
     def gen_possible(self, min_len: int, max_len: int, state: MatchState) -> Iterable[PossibleMatch]:
-        match = state.groups.get(self.group.index)
-        if min_len <= len(match) <= max_len:
-            yield possible_match(match, state)
+        bindings = state.groups.get(self.group.index)
+        n = bindings.end - bindings.start
+        if min_len <= n <= max_len:
+            chr_seq = ChrSeq(tuple(ChrRef(i) for i in range(bindings.start, bindings.end)))
+            yield possible_match(chr_seq, state)
 
     @classmethod
     def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, ReSeq]) -> 'ReGroupRef':
@@ -506,7 +532,7 @@ class Position:
     cell: 'Cell'
 
     def __repr__(self) -> str:
-        return f'<Cn ix={self.index} st={self.string.pattern.raw!r} cl={self.cell.position}>'
+        return f'<Cn ix={self.index} st={self.string.pattern.raw!r} cl={self.cell.index}>'
 
 
 @dataclass()
@@ -515,7 +541,7 @@ class String:
     positions: List[Position]
 
     def __repr__(self) -> str:
-        cns = ', '.join(f'{c.cell.position}' for c in self.positions)
+        cns = ', '.join(f'{c.cell.index}' for c in self.positions)
         return f'<St pt={self.pattern.raw!r} cns=[{cns}]>'
 
     @property
@@ -526,6 +552,9 @@ class String:
         return self.pattern.re.gen_possible(self.size, self.size, empty_state)
 
 
+cell_ix_type = Tuple[int, int]
+
+
 @dataclass()
 class Cell:
     row: int
@@ -533,15 +562,15 @@ class Cell:
     positions: List[Position]
 
     @property
-    def position(self):
+    def index(self) -> cell_ix_type:
         return self.row, self.col
 
     def __repr__(self) -> str:
         cns = ', '.join(f'{c.index}@{c.string.pattern.raw!r}' for c in self.positions)
-        return f'<Ce pt={self.position} cns=[{cns}]>'
+        return f'<Ce ix={self.index} cns=[{cns}]>'
 
 
-def build_constraints() -> List[String]:
+def build_strings() -> List[String]:
     cells = [[Cell(i, j, []) for j in range(row_size(i))]
              for i in range(constants.size)]
 
@@ -587,13 +616,243 @@ def build_constraints() -> List[String]:
     return strings
 
 
+class Constraint(ABC):
+
+    @classmethod
+    def for_chr(cls, chr: ReChr):
+        pass
+
+    @abstractmethod
+    def intersection(self, other: 'Constraint') -> Optional['Constraint']:
+        pass
+
+
+class AnyConstraint(Constraint):
+
+    def __new__(cls) -> Any:
+        global any_constraint
+        try:
+            return any_constraint
+        except NameError:
+            return super().__new__(cls)
+
+    def intersection(self, other: Constraint) -> Constraint:
+        return other
+
+
+any_constraint = AnyConstraint()
+
+
+@dataclass(frozen=True)
+class LiteralConstraint(Constraint):
+    chars: FrozenSet[str]
+    negate: bool
+
+    def intersection(self, other: Constraint) -> Optional[Constraint]:
+        if other is any_constraint:
+            return self
+        if isinstance(other, RefConstraint):
+            return CompoundConstraint(self, other)
+        if isinstance(other, CompoundConstraint):
+            lit = self.intersection(other.lit_constraint)
+            if lit is None:
+                return None
+            assert isinstance(lit, LiteralConstraint)
+            return CompoundConstraint(lit, other.ref_constraint)
+
+        assert isinstance(other, LiteralConstraint)
+        if self.negate == other.negate:
+            if self.negate:
+                return LiteralConstraint(self.chars | other.chars, negate=True)
+            combined = self.chars & other.chars
+            if not combined:
+                return None
+            return LiteralConstraint(combined, negate=False)
+
+        pos, neg = self, other
+        if pos.negate:
+            pos, neg = neg, pos
+        assert not pos.negate
+        assert neg.negate
+        combined = pos.chars - neg.chars
+        if not combined:
+            return None
+        return LiteralConstraint(combined, negate=False)
+
+    @classmethod
+    def for_re_lit(cls, chr: ReLit) -> 'LiteralConstraint':
+        return cls(frozenset(chr.chars), chr.negate)
+
+
+@dataclass(frozen=True)
+class RefConstraint(Constraint):
+    indices: FrozenSet[cell_ix_type]
+
+    def intersection(self, other: Constraint) -> Constraint:
+        if other is any_constraint:
+            return self
+        if isinstance(other, LiteralConstraint):
+            return CompoundConstraint(other, self)
+        if isinstance(other, CompoundConstraint):
+            ref = other.ref_constraint.intersection(self)
+            assert isinstance(ref, RefConstraint)
+            return CompoundConstraint(other.lit_constraint, ref)
+
+        assert isinstance(other, RefConstraint)
+        return RefConstraint(self.indices | other.indices)
+
+
+@dataclass(frozen=True)
+class CompoundConstraint(Constraint):
+    lit_constraint: LiteralConstraint
+    ref_constraint: RefConstraint
+
+    def intersection(self, other: Constraint) -> Optional[Constraint]:
+        if not isinstance(other, CompoundConstraint):
+            return other.intersection(self)
+        lit = self.lit_constraint.intersection(other.lit_constraint)
+        if lit is None:
+            return None
+        assert isinstance(lit, LiteralConstraint)
+        ref = self.ref_constraint.intersection(other.ref_constraint)
+        assert isinstance(ref, RefConstraint)
+        return CompoundConstraint(lit, ref)
+
+
+class Solution:
+    cells: Dict[cell_ix_type, Constraint]
+
+    def __init__(self, cells: Dict[cell_ix_type, Constraint]):
+        self.cells = cells
+
+    @classmethod
+    def for_chr_seq(cls, string: String, chr_seq: ChrSeq) -> 'Solution':
+        assert string.size == len(chr_seq)
+        cells: Dict[cell_ix_type, Constraint] = {}
+        for i, position in enumerate(string.positions):
+            assert position.index == i
+            ix = position.cell.index
+            chr = chr_seq[i]
+            if isinstance(chr, ReAny):
+                constraint = any_constraint
+            elif isinstance(chr, ReLit):
+                constraint = LiteralConstraint.for_re_lit(chr)
+            elif isinstance(chr, ChrRef):
+                ref_index = string.positions[chr.index].cell.index
+                constraint = RefConstraint(frozenset([ref_index]))
+            else:
+                raise TypeError(f'{chr!r}')
+            cells[ix] = constraint
+        return cls(cells)
+
+    @classmethod
+    def generate_solutions(cls, string: String) -> Iterable['Solution']:
+        for match in string.gen_possible():
+            yield cls.for_chr_seq(string, match.chr_seq)
+
+    def intersection(self, other: 'Solution') -> Optional['Solution']:
+        ixs_s = set(self.cells)
+        ixs_o = set(other.cells)
+        intersection = ixs_s & ixs_o
+
+        cells = {}
+        for ix in intersection:
+            c = self.cells[ix].intersection(other.cells[ix])
+            if c is None:
+                return None
+            cells[ix] = c
+
+        def add_unique(ixs: Set[cell_ix_type], source: Dict[cell_ix_type, Constraint]):
+            for ix in ixs - intersection:
+                cells[ix] = source[ix]
+
+        add_unique(ixs_s, self.cells)
+        add_unique(ixs_o, other.cells)
+
+        @lru_cache(100)
+        def resolve_compound(cell_ix: cell_ix_type) -> Optional[CompoundConstraint]:
+            cc = cells[cell_ix]
+            acc = cc
+            for ref_ix in cc.ref_constraint.indices:
+                ref_c = cells[ref_ix]
+                if isinstance(ref_c, CompoundConstraint):
+                    ref_c = resolve_compound(ref_ix)
+                    if ref_c is None:
+                        return None
+                acc = acc.intersection(ref_c)
+                if acc is None:
+                    return None
+                assert isinstance(acc, CompoundConstraint)
+            return acc
+
+        for k, c in cells.items():
+            if isinstance(c, CompoundConstraint):
+                r = resolve_compound(k)
+                if r is None:
+                    return None
+                cells[k] = r
+
+        return Solution(cells)
+
+
+@dataclass(frozen=True)
+class SolutionSource:
+    name: str
+    solutions: Iterable[Solution]
+
+
+def merge_two_solutions_seq(xs: SolutionSource, ys: SolutionSource, callback: Callable[[str, bool], Any]
+                            ) -> SolutionSource:
+    name = f'{xs.name} & {ys.name}'
+
+    def gen() -> Iterable[Solution]:
+        xl = list(xs.solutions)
+        for y in ys.solutions:
+            for x in xl:
+                i = y.intersection(x)
+                if i is None:
+                    callback(name, False)
+                else:
+                    callback(name, True)
+                    yield i
+
+    return SolutionSource(name, gen())
+
+
+def merge_many_solutions(sol_seqs: Iterable[SolutionSource],
+                         callback: Callable[[str, bool], Any]) -> SolutionSource:
+    acc: Optional[SolutionSource] = None
+    for sol in sol_seqs:
+        if acc is None:
+            acc = sol
+        else:
+            acc = merge_two_solutions_seq(acc, sol, callback)
+    return SolutionSource('', []) if acc is None else acc
+
+
 def main():
-    strings = build_constraints()
+    from pprint import pprint
+    strings = build_strings()
     for s in strings:
         print(s.pattern.raw, s.size)
         for m in s.gen_possible():
             print(' ', m.chr_seq)
         print('-' * 60)
+
+    strings.sort(key=lambda st: st.size)
+
+    i = 0
+
+    def callback(name, res):
+        nonlocal i
+        i += 1
+        if i % 50 == 0:
+            print(('no', '  ')[res], 'match', name)
+
+    lazy_solutions = merge_many_solutions((SolutionSource(s.pattern.raw, Solution.generate_solutions(s))
+                                           for s in strings), callback)
+    for solution in lazy_solutions.solutions:
+        pprint(solution.cells)
 
 
 __name__ == '__main__' and main()
