@@ -121,6 +121,16 @@ class ReCombinationsTest(unittest.TestCase):
                               cm('ABCCC'),
                               cm('BCCCC')])
 
+    def test_multiple_refs(self):
+        re = solver.ReSeq.from_string(r'.*(.)(.)(.)(.)\4\3\2\1.*')
+        matches = list(re.gen_possible(12, 12, empty_state))
+        chr_seqs_str = [str(m.chr_seq) for m in matches]
+        self.assertListEqual(chr_seqs_str, ['........<7><6><5><4>',
+                                            '.......<6><5><4><3>.',
+                                            '......<5><4><3><2>..',
+                                            '.....<4><3><2><1>...',
+                                            '....<3><2><1><0>....'])
+
 
 class SolutionTest(unittest.TestCase):
 
@@ -142,7 +152,6 @@ class SolutionTest(unittest.TestCase):
         for i in range(n):
             cls.pos(string, solver.Cell(0, i, []), i)
         return solver.Solution.generate_solutions(string)
-
 
     @classmethod
     def gen_single_solution(cls, chars: str, n: int) -> solver.Solution:

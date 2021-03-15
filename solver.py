@@ -6,12 +6,13 @@ from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
-                    TypeVar, FrozenSet, Set)
+                    TypeVar, FrozenSet, Set, Iterator)
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import PatchCollection
 from matplotlib.markers import Path as MarkerPath
+from matplotlib.patches import FancyArrowPatch
 from matplotlib.transforms import Affine2D
 
 import constants
@@ -26,66 +27,6 @@ def row_size(row_index: int) -> int:
     return mid + min(row_index + 1, size - row_index)
 
 
-def draw_puzzel(ax=None, fig_size=11, fontsize=13, font='DejaVu Sans Mono'):
-    if ax is None:
-        f = plt.figure(figsize=(fig_size, fig_size))
-        ax = f.add_subplot(111)
-
-    unit_hex = plt.Polygon(MarkerPath.unit_regular_polygon(6).vertices,
-                           edgecolor='k', linewidth=1, fill=True, facecolor='#ffefa8')
-    unit_hex.set_transform(Affine2D().scale(0.577))
-
-    vscale = 1 / 1.154
-
-    def position(i, j):
-        x = j + (constants.size - row_size(i)) / 2.0
-        y = i * vscale
-        return x, y
-
-    def translate_hexagon(x, y):
-        patch = copy.copy(unit_hex)
-        patch.set_transform(patch.get_transform() + Affine2D().translate(x, y))
-        return patch
-
-    patches = [translate_hexagon(*position(i, j))
-               for i in range(constants.size)
-               for j in range(row_size(i))]
-
-    p = PatchCollection(patches, match_original=True)
-
-    ax.add_collection(p)
-
-    def text(x, y, s, **kwds):
-        ax.text(x, y, s,
-                fontsize=fontsize,
-                fontproperties=dict(family=font),
-                bbox=dict(facecolor='#dffcd7', edgecolor='k'),
-                **kwds)
-
-    def texts(vs, pos, off=(0, 0), inv=False, align='left', rot=0, anchor=False, **kwds):
-        for i, s in enumerate(vs):
-            if inv:
-                i = constants.size - i - 1
-            x, y = pos(i)
-            x += off[0]
-            y += off[1]
-            if anchor:
-                kwds['rotation_mode'] = 'anchor'
-            text(x, y, s, horizontalalignment=align, rotation=rot, **kwds)
-
-    texts(constants.x[:mid + 1:], pos=lambda i: position(12, i), off=(0.1, 0.7), rot=60)
-    texts(constants.x[mid + 1::], inv=True, pos=lambda i: position(i, row_size(i)), off=(-0.2, -0.3), rot=60)
-
-    texts(constants.y[:mid + 1:], inv=True, pos=lambda i: position(i, 0), off=(-0.8, 0), align='right')
-    texts(constants.y[mid + 1::], pos=lambda i: position(mid - i - 1, 0), off=(-0.8, -0.3), align='right')
-
-    texts(constants.z[:mid + 1:], pos=lambda i: position(0, i), off=(0.15, -0.8), rot=-60, anchor=True)
-    texts(constants.z[mid + 1::], pos=lambda i: position(i, row_size(i)), off=(0, 0.3), rot=-60, anchor=True)
-
-    ax.set_xlim(-6, 17)
-    ax.set_ylim(-6, 17)
-
-
 T = TypeVar('T')
 
 
@@ -98,14 +39,7 @@ class ChrSeq(Sequence['ReChr']):
     chrs: Tuple['ReChr', ...]
 
     def add(self, other: 'ChrSeq') -> 'ChrSeq':
-        offset = len(self)
-
-        def offset_char(chr: ReChr) -> ReChr:
-            if isinstance(chr, ChrRef):
-                return chr.offset(offset)
-            return chr
-
-        return chr_seq(self.chrs + tuple(map(offset_char, other.chrs)))
+        return chr_seq(self.chrs + other.chrs)
 
     @overload
     def __getitem__(self, i: int) -> 'ReChr':
@@ -125,10 +59,10 @@ class ChrSeq(Sequence['ReChr']):
         return len(self.chrs)
 
     def __str__(self):
-        return repr(''.join(map(str, self.chrs)))
+        return ''.join(map(str, self.chrs))
 
     def __repr__(self) -> str:
-        return f'<CSeq {self!s}>'
+        return f'<CSeq {self!r}>'
 
 
 @lru_cache(1000)
@@ -184,14 +118,13 @@ empty_group_bindings = GroupBindings(())
 
 @dataclass(frozen=True)
 class MatchState:
+    start_index: int = 0
     groups: GroupBindings = empty_group_bindings
 
-    def copy(self,
+    def copy(self, start_index: Optional[int] = None,
              groups: Optional[GroupBindings] = None) -> 'MatchState':
-        return MatchState(groups=or_else(groups, self.groups))
-
-    def extend(self, other, offset: int) -> 'MatchState':
-        return self.copy(groups=self.groups.merge(other.groups.offset(offset)))
+        return MatchState(start_index=or_else(start_index, self.start_index),
+                          groups=or_else(groups, self.groups))
 
 
 empty_state = MatchState()
@@ -212,11 +145,10 @@ class PossibleMatch:
                               state=or_else(state, self.state))
 
     def extend(self, other: 'PossibleMatch'):
-        n = len(self.chr_seq)
-        if not n:
+        if not self.chr_seq:
             return other
-        return self.copy(chr_seq=self.chr_seq.add(other.chr_seq),
-                         state=self.state.extend(other.state, n))
+        return other.copy(chr_seq=self.chr_seq.add(other.chr_seq),
+                          state=other.state.copy(start_index=self.state.start_index))
 
 
 def possible_match(chr_seq: ChrSeq, state: MatchState = empty_state) -> PossibleMatch:
@@ -332,11 +264,13 @@ Re.op_converters[sre_constants.IN] = ReLit.from_op_arg
 def extend_matches(re: Re, max_len: int, previous: Iterable[PossibleMatch]) -> Iterable[PossibleMatch]:
     if max_len < 0:
         return
-    for p in previous:
-        mx = max_len - len(p.chr_seq)
+    for prev in previous:
+        n = len(prev.chr_seq)
+        mx = max_len - n
         if mx >= 0:  # repeat can have 0-length matches
-            for match in re.gen_possible(0, mx, p.state):
-                yield p.extend(match)
+            for match in re.gen_possible(0, mx, prev.state.copy(start_index=n + prev.state.start_index)):
+                ext = prev.extend(match)
+                yield ext
 
 
 @dataclass(frozen=True)
@@ -366,8 +300,10 @@ class ReSeq(Re):
                     assert s <= max_len
                     if s >= min_len:
                         if self.index is not None:
+                            start_ix = p.state.start_index
                             p = p.copy(state=p.state.copy(
-                                p.state.groups.bind(self.index, GroupBinding(start=0, end=s))))
+                                groups=p.state.groups.bind(self.index,
+                                                           GroupBinding(start=start_ix, end=start_ix + s))))
                         yield p
             else:
                 yield from rec(index + 1, extend_matches(res[index],
@@ -406,17 +342,12 @@ Re.op_converters[sre_constants.SUBPATTERN] = ReSeq.from_op_arg
 @dataclass(frozen=True)
 class ChrRef(ReChr):
     index: int
-    needs_offset: bool = False
 
     def __str__(self):
         return f'<{self.index}>'
 
     def __repr__(self):
         return f'<ChrRef {self.index}>'
-
-    def offset(self, n: int) -> 'ChrRef':
-        # don't offset first time
-        return ChrRef(self.index if not self.needs_offset else self.index + n, True)
 
     def __eq__(self, o: object) -> bool:
         return isinstance(o, ChrRef) and self.index == o.index
@@ -433,10 +364,10 @@ class ReGroupRef(Re):
         return self.group.span()
 
     def gen_possible(self, min_len: int, max_len: int, state: MatchState) -> Iterable[PossibleMatch]:
-        bindings = state.groups.get(self.group.index)
-        n = bindings.end - bindings.start
+        binding = state.groups.get(self.group.index)
+        n = binding.end - binding.start
         if min_len <= n <= max_len:
-            chr_seq = ChrSeq(tuple(ChrRef(i) for i in range(bindings.start, bindings.end)))
+            chr_seq = ChrSeq(tuple(ChrRef(i) for i in range(binding.start, binding.end)))
             yield possible_match(chr_seq, state)
 
     @classmethod
@@ -539,6 +470,7 @@ class Position:
 class String:
     pattern: Pattern
     positions: List[Position]
+    name: str = ''
 
     def __repr__(self) -> str:
         cns = ', '.join(f'{c.cell.index}' for c in self.positions)
@@ -576,8 +508,8 @@ def build_strings() -> List[String]:
 
     strings: List[String] = []
 
-    def make_string(s: str) -> String:
-        s = String(Pattern(s, ReSeq.from_string(s)), [])
+    def make_string(s: str, name: str) -> String:
+        s = String(Pattern(s, ReSeq.from_string(s)), [], name)
         strings.append(s)
         return s
 
@@ -587,24 +519,40 @@ def build_strings() -> List[String]:
         s.positions.append(cn)
         cell.positions.append(cn)
 
-    def add_horizontal():
-        for i, s in enumerate(constants.y):
-            s = make_string(s)
+    def add_y():
+        for i, s in enumerate(constants.y[::-1]):
+            s = make_string(s, f'y{i}')
             for j, c in enumerate(cells[i]):
                 pos(s, c, j)
 
-    def add_diag(ss: List[str], reverse=False):
-        for i, s in enumerate(ss):
-            s = make_string(s)
-            start = max(0, i - mid)
-            end = min(i + mid + 1, constants.size)
+    def create_diag_range(i: int) -> Tuple[int, int]:
+        start = max(0, i - mid)
+        end = min(i + mid + 1, constants.size)
+        return start, end
+
+    def add_x():
+        for ii, s in enumerate(constants.x):
+            s = make_string(s, f'x{ii}')
+            start, end = create_diag_range(ii)
+            for jj in range(start, end):
+                i = constants.size - jj - 1
+                j = ii
+                if jj > mid:
+                    j -= jj - mid
+                cell = cells[i][j]
+                pos(s, cell, end - jj - 1)
+
+    def add_z():
+        for i, s in enumerate(constants.z):
+            s = make_string(s, f'z{i}')
+            start, end = create_diag_range(i)
             for j in range(start, end):
                 cell = cells[j][i if j <= mid else i - (j - mid)]
-                pos(s, cell, end - j - 1 if reverse else j - start)
+                pos(s, cell, end - j - 1)
 
-    add_horizontal()
-    add_diag(constants.x, reverse=True)
-    add_diag(constants.z, reverse=False)
+    add_y()
+    add_x()
+    add_z()
 
     for string in strings:
         string.positions.sort(key=lambda c: c.index)
@@ -626,6 +574,10 @@ class Constraint(ABC):
     def intersection(self, other: 'Constraint') -> Optional['Constraint']:
         pass
 
+    @abstractmethod
+    def label(self) -> str:
+        pass
+
 
 class AnyConstraint(Constraint):
 
@@ -639,7 +591,15 @@ class AnyConstraint(Constraint):
     def intersection(self, other: Constraint) -> Constraint:
         return other
 
+    def label(self) -> str:
+        return '.'
 
+
+# Need for reloading
+try:
+    del any_constraint
+except NameError:
+    pass
 any_constraint = AnyConstraint()
 
 
@@ -679,6 +639,14 @@ class LiteralConstraint(Constraint):
             return None
         return LiteralConstraint(combined, negate=False)
 
+    def label(self) -> str:
+        s = ''.join(self.chars)
+        if self.negate:
+            s = '^' + s
+        if len(s) > 1:
+            s = f'[{s}]'
+        return s
+
     @classmethod
     def for_re_lit(cls, chr: ReLit) -> 'LiteralConstraint':
         return cls(frozenset(chr.chars), chr.negate)
@@ -701,6 +669,9 @@ class RefConstraint(Constraint):
         assert isinstance(other, RefConstraint)
         return RefConstraint(self.indices | other.indices)
 
+    def label(self) -> str:
+        return ', '.join('%d,%d' % x for x in sorted(self.indices))
+
 
 @dataclass(frozen=True)
 class CompoundConstraint(Constraint):
@@ -717,6 +688,9 @@ class CompoundConstraint(Constraint):
         ref = self.ref_constraint.intersection(other.ref_constraint)
         assert isinstance(ref, RefConstraint)
         return CompoundConstraint(lit, ref)
+
+    def label(self) -> str:
+        return self.lit_constraint.label() + ' : ' + self.ref_constraint.label()
 
 
 class Solution:
@@ -801,14 +775,39 @@ class SolutionSource:
     solutions: Iterable[Solution]
 
 
+class RepeatableLazy(Iterable[T]):
+    source: Iterator[T]
+    realized: List[T]
+    is_realized: bool = False
+
+    def __init__(self, source: Iterator[T]):
+        self.source = source
+        self.realized = []
+
+    def __iter__(self) -> Iterator[T]:
+        if self.is_realized:
+            return iter(self.realized)
+        return iter(self.realize())
+
+    def realize(self) -> Iterable[T]:
+        sentinel = object()
+        while True:
+            n = next(self.source, sentinel)
+            if n is sentinel:
+                self.is_realized = True
+                break
+            yield n
+            self.realized.append(n)
+
+
 def merge_two_solutions_seq(xs: SolutionSource, ys: SolutionSource, callback: Callable[[str, bool], Any]
                             ) -> SolutionSource:
     name = f'{xs.name} & {ys.name}'
 
     def gen() -> Iterable[Solution]:
-        xl = list(xs.solutions)
-        for y in ys.solutions:
-            for x in xl:
+        yl = RepeatableLazy(iter(ys.solutions))
+        for x in xs.solutions:
+            for y in yl:
                 i = y.intersection(x)
                 if i is None:
                     callback(name, False)
@@ -830,6 +829,122 @@ def merge_many_solutions(sol_seqs: Iterable[SolutionSource],
     return SolutionSource('', []) if acc is None else acc
 
 
+class PuzzleDrawer:
+    ax: plt.Axes
+    fontsize: int = 13
+    font: str = 'DejaVu Sans Mono'
+
+    v_scale: float = 1 / 1.154
+
+    unit_hex: plt.Polygon = plt.Polygon(MarkerPath.unit_regular_polygon(6).vertices,
+                                        edgecolor='k', linewidth=1, fill=True, facecolor='#ffefa8')
+    unit_hex.set_transform(Affine2D().scale(0.577))
+
+    def __init__(self,
+                 ax: plt.Axes,
+                 fontsize: Optional[int] = None,
+                 font: Optional[str] = None):
+        self.ax = ax
+        if fontsize is not None:
+            self.fontsize = fontsize
+        if font is not None:
+            self.font = font
+
+    def position(self, i, j) -> Tuple[float, float]:
+        x = j + (constants.size - row_size(i)) / 2.0
+        y = i * self.v_scale
+        return x, y
+
+    def translate_hexagon(self, x, y) -> plt.Polygon:
+        patch = copy.copy(self.unit_hex)
+        patch.set_transform(patch.get_transform() + Affine2D().translate(x, y))
+        return patch
+
+    def create_hexagons(self) -> PatchCollection:
+        patches = [self.translate_hexagon(*self.position(i, j))
+                   for i in range(constants.size)
+                   for j in range(row_size(i))]
+        return PatchCollection(patches, match_original=True)
+
+    def draw_hexagons(self):
+        self.ax.add_collection(self.create_hexagons())
+
+    def text(self, x, y, s, background_color='#dffcd7', fontsize=None, **kwds):
+        self.ax.text(x, y, s,
+                     fontsize=or_else(fontsize, self.fontsize),
+                     fontproperties=dict(family=self.font),
+                     bbox=dict(facecolor=background_color, edgecolor='k'),
+                     **kwds)
+
+    def texts(self, vs, pos, off=(0, 0), inv=False, align='left', rot=0, anchor=False, **kwds):
+        for i, s in enumerate(vs):
+            if inv:
+                i = constants.size - i - 1
+            x, y = pos(i)
+            x += off[0]
+            y += off[1]
+            if anchor:
+                kwds['rotation_mode'] = 'anchor'
+            self.text(x, y, s, horizontalalignment=align, rotation=rot, **kwds)
+
+    def draw_texts(self):
+        self.texts(constants.x[:mid + 1:], pos=lambda i: self.position(12, i),
+                   off=(0.1, 0.7), rot=60)
+        self.texts(constants.x[mid + 1::], inv=True, pos=lambda i: self.position(i, row_size(i)),
+                   off=(-0.2, -0.3), rot=60)
+
+        self.texts(constants.y[:mid + 1:], inv=True, pos=lambda i: self.position(i, 0),
+                   off=(-0.8, 0), align='right')
+        self.texts(constants.y[mid + 1::], pos=lambda i: self.position(mid - i - 1, 0),
+                   off=(-0.8, -0.3), align='right')
+
+        self.texts(constants.z[:mid + 1:], pos=lambda i: self.position(0, i),
+                   off=(0.15, -0.8), rot=-60, anchor=True)
+        self.texts(constants.z[mid + 1::], pos=lambda i: self.position(i, row_size(i)),
+                   off=(0, 0.3), rot=-60, anchor=True)
+
+    def draw_arrow(self, start, end, color='r'):
+        arrow = FancyArrowPatch(start, end,
+                                connectionstyle="arc3,rad=.5",
+                                shrinkA=0, shrinkB=0,
+                                arrowstyle="Simple, tail_width=0.5, head_width=10, head_length=20",
+                                color=color)
+        self.ax.add_patch(arrow)
+
+    def draw_solution(self, solution: Solution):
+        for (i, j), con in solution.cells.items():
+            x, y = self.position(i, j)
+            self.text(x, y, con.label(), background_color='#b5f1ff')
+
+            ref_con = None
+            if isinstance(con, RefConstraint):
+                ref_con = con
+            elif isinstance(con, CompoundConstraint):
+                ref_con = con.ref_constraint
+
+            if ref_con is not None:
+                for ref in ref_con.indices:
+                    self.draw_arrow((x, y), self.position(*ref))
+
+
+def draw_puzzle(ax: Optional[plt.Axes] = None, fig_size=11, fontsize=13, font='DejaVu Sans Mono',
+                solution: Optional[Solution] = None) -> PuzzleDrawer:
+    if ax is None:
+        f = plt.figure(figsize=(fig_size, fig_size))
+        ax = f.add_subplot(111)
+
+    drawer = PuzzleDrawer(ax, fontsize=fontsize, font=font)
+    drawer.draw_hexagons()
+    drawer.draw_texts()
+    if solution is not None:
+        drawer.draw_solution(solution)
+
+    ax.set_xlim(-6, 17)
+    ax.set_ylim(-6, 17)
+
+    return drawer
+
+
 def main():
     from pprint import pprint
     strings = build_strings()
@@ -841,6 +956,8 @@ def main():
 
     strings.sort(key=lambda st: st.size)
 
+    strings = strings[:5:]
+
     i = 0
 
     def callback(name, res):
@@ -849,10 +966,11 @@ def main():
         if i % 50 == 0:
             print(('no', '  ')[res], 'match', name)
 
-    lazy_solutions = merge_many_solutions((SolutionSource(s.pattern.raw, Solution.generate_solutions(s))
+    lazy_solutions = merge_many_solutions((SolutionSource(f'{s.pattern.raw}={s.size}', Solution.generate_solutions(s))
                                            for s in strings), callback)
     for solution in lazy_solutions.solutions:
         pprint(solution.cells)
+        break
 
 
 __name__ == '__main__' and main()
