@@ -2,11 +2,12 @@ import copy
 import sre_constants
 import sre_parse
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
+from random import Random
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
-                    TypeVar, FrozenSet, Set, Iterator)
+                    TypeVar, FrozenSet, Iterator)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +15,7 @@ from matplotlib.collections import PatchCollection
 from matplotlib.markers import Path as MarkerPath
 from matplotlib.patches import FancyArrowPatch
 from matplotlib.transforms import Affine2D
+from tqdm import tqdm
 
 import constants
 
@@ -725,19 +727,31 @@ class Solution:
             yield cls.for_chr_seq(string, match.chr_seq)
 
     def intersection(self, other: 'Solution') -> Optional['Solution']:
-        ixs_s = set(self.cells)
-        ixs_o = set(other.cells)
-        intersection = ixs_s & ixs_o
+        ixs_both, ixs_o, ixs_s = self.compute_intersection_sets(other)
+        return self._intersection(ixs_both, ixs_o, ixs_s, other)
 
+    def can_intersect(self, other: 'Solution') -> bool:
+        ixs_both, ixs_o, ixs_s = self.compute_intersection_sets(other)
+        if not ixs_both:
+            return True
+        return self._intersection(ixs_both, ixs_o, ixs_s, other) is not None
+
+    def compute_intersection_sets(self, other: 'Solution'):
+        ixs_s = frozenset(self.cells)
+        ixs_o = frozenset(other.cells)
+        ixs_both = ixs_s.intersection(ixs_o)
+        return ixs_both, ixs_o, ixs_s
+
+    def _intersection(self, ixs_both, ixs_o, ixs_s, other):
         cells = {}
-        for ix in intersection:
+        for ix in ixs_both:
             c = self.cells[ix].intersection(other.cells[ix])
             if c is None:
                 return None
             cells[ix] = c
 
-        def add_unique(ixs: Set[cell_ix_type], source: Dict[cell_ix_type, Constraint]):
-            for ix in ixs - intersection:
+        def add_unique(ixs: FrozenSet[cell_ix_type], source: Dict[cell_ix_type, Constraint]):
+            for ix in ixs - ixs_both:
                 cells[ix] = source[ix]
 
         add_unique(ixs_s, self.cells)
@@ -765,8 +779,196 @@ class Solution:
                 if r is None:
                     return None
                 cells[k] = r
-
         return Solution(cells)
+
+
+class SolutionSet(Collection[Solution]):
+    names: FrozenSet[str]
+    cell_indices: FrozenSet[cell_ix_type]
+    solutions: Collection[Solution]
+
+    def __init__(self,
+                 names: FrozenSet[str],
+                 cell_indices: FrozenSet[cell_ix_type],
+                 solutions: Collection[Solution]):
+        self.names = names
+        self.cell_indices = cell_indices
+        self.solutions = solutions
+
+    @property
+    def names_str(self) -> str:
+        return ', '.join(sorted(self.names))
+
+    def __len__(self) -> int:
+        return len(self.solutions)
+
+    def __iter__(self) -> Iterator[Solution]:
+        return iter(self.solutions)
+
+    def __contains__(self, x: object) -> bool:
+        raise NotImplementedError()
+
+    def contains(self, other: 'SolutionSet') -> bool:
+        return self.names >= other.names
+
+    def intersection(self, other: 'SolutionSet') -> 'SolutionSet':
+        if self.contains(other):
+            return self
+        if other.contains(self):
+            return other
+
+        solutions = []
+        for a in self:
+            for b in other:
+                ab = a.intersection(b)
+                if ab is not None:
+                    solutions.append(ab)
+
+        return SolutionSet(self.names | other.names, self.cell_indices | other.cell_indices, solutions)
+
+    def cell_intersection(self, other: 'SolutionSet') -> FrozenSet[cell_ix_type]:
+        return self.cell_indices & other.cell_indices
+
+    def cell_intersection_frac(self, other: 'SolutionSet') -> float:
+        return len(self.cell_intersection(other)) / max(len(self), len(other))
+
+    def estimate_intersection_size(self, other: 'SolutionSet', random: Random, sample_size=50,
+                                   rate_floor_clamp=0.005) -> float:
+        if not self.cell_intersection(other):
+            return len(self) * len(other)
+
+        def sample(ss: SolutionSet) -> Collection[Solution]:
+            if len(ss) < sample_size:
+                return ss
+            shuffled = list(ss.solutions)
+            random.shuffle(shuffled)
+            return shuffled[:sample_size:]
+
+        sample_a = sample(self)
+        sample_b = sample(other)
+        intersection_count = sum(1 for a in sample_a for b in sample_b if a.can_intersect(b))
+        intersection_rate = intersection_count / (len(sample_b) * len(sample_b))
+        intersection_rate = max(intersection_rate, rate_floor_clamp)
+        return intersection_rate * (len(self) * len(other))
+
+    @classmethod
+    def for_string(cls, s: String):
+        return cls(frozenset([s.name]),
+                   frozenset(p.cell.index for p in s.positions),
+                   tuple(Solution.generate_solutions(s)))
+
+
+def select_smallest_solution_set(solution_sets: Iterable[SolutionSet]) -> SolutionSet:
+    smallest: Optional[SolutionSet] = None
+    for solution_set in solution_sets:
+        if len(solution_set) <= 1:
+            return solution_set
+        if smallest is None or len(solution_set) < len(smallest):
+            smallest = solution_set
+    return smallest
+
+
+def drop_redundant_solution_sets(solution_sets: Iterable[SolutionSet]) -> Collection[SolutionSet]:
+    unique_solution_sets: Iterable[SolutionSet] = {s.names: s for s in solution_sets}.values()
+    return [s for s in unique_solution_sets
+            if not any(o.contains(s) for o in unique_solution_sets if o is not s)]
+
+
+class SolutionSetIntersectionCache:
+    cache: Dict[FrozenSet[str], SolutionSet]
+
+    def __init__(self, existing: Iterable[SolutionSet] = ()):
+        self.cache = {s.names: s for s in existing}
+
+    def intersection(self, a: SolutionSet, b: SolutionSet) -> SolutionSet:
+        key = a.names | b.names
+        result = self.cache.get(key)
+        if result is None:
+            result = self.cache[key] = a.intersection(b)
+        return result
+
+
+def merge_cross_axes_solution_sets(axes_solution_sets: Dict[str, Collection[SolutionSet]]):
+    axes = frozenset(axes_solution_sets)
+    intersection = SolutionSetIntersectionCache().intersection
+    intersections = []
+    with tqdm(total=sum(map(len, axes_solution_sets.values()))) as progress:
+        for axis, axis_solutions in axes_solution_sets.items():
+            other_axes_solutions = [other_solution for other_axis in axes - {axis}
+                                    for other_solution in axes_solution_sets[other_axis]]
+            for axis_solution in axis_solutions:
+                progress.set_description(f'merge cross axis {axis_solution.names_str} sz={len(axis_solution)}')
+                progress.update()
+                intersections.append(select_smallest_solution_set(intersection(axis_solution, p)
+                                                                  for p in other_axes_solutions))
+    return drop_redundant_solution_sets(intersections)
+
+
+def reduce_solution_sets_using_best_pair_intersections(solution_sets: Collection[SolutionSet]
+                                                       ) -> Collection[SolutionSet]:
+    solution_sets = sorted(solution_sets, key=len)
+    intersection = SolutionSetIntersectionCache(solution_sets).intersection
+    intersections = []
+    with tqdm(solution_sets, desc='reduce_best_pair_intersect') as progress:
+        for solution_set in progress:
+            solution_set: SolutionSet = solution_set
+
+            def gen_intersections() -> Iterable[SolutionSet]:
+                for other in solution_sets:
+                    if other is not solution_set:
+                        progress.set_description(f'reduce {solution_set.names_str} n={len(solution_set)} & ' +
+                                                 f'{other.names_str} n={len(other)}')
+                        yield intersection(solution_set, other)
+
+            intersections.append(select_smallest_solution_set(gen_intersections()))
+    return drop_redundant_solution_sets(intersections)
+
+
+def reduce_solution_sets_by_smallest_pair(solution_sets: Collection[SolutionSet]) -> Collection[SolutionSet]:
+    if len(solution_sets) <= 1:
+        return solution_sets
+    solution_sets = sorted(solution_sets, key=len, reverse=True)
+    a = solution_sets.pop(-1)
+    b = solution_sets.pop(-1)
+    solution_sets.append(a.intersection(b))
+    return solution_sets
+
+
+def reduce_solution_sets_by_highest_overlap(solution_sets: Collection[SolutionSet]) -> Collection[SolutionSet]:
+    if len(solution_sets) <= 1:
+        return solution_sets
+    solution_sets = list(solution_sets)
+    n = len(solution_sets)
+    indexes = ((i, j) for i in range(n) for j in range(i + 1, n))
+    i, j = max(indexes, key=lambda x: solution_sets[x[0]].cell_intersection_frac(solution_sets[x[1]]))
+    assert j > i  # pop the largest index first so smaller is still valid
+    a = solution_sets.pop(j)
+    b = solution_sets.pop(i)
+    solution_sets.append(a.intersection(b))
+    return solution_sets
+
+
+def reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[SolutionSet], random: Random
+                                                   ) -> Collection[SolutionSet]:
+    if len(solution_sets) <= 1:
+        return solution_sets
+    solution_sets = list(solution_sets)
+    n = len(solution_sets)
+
+    def gen_indexes():
+        with tqdm(total=n * (n - 1) // 2) as progress:
+            for i in range(n):
+                for j in range(i + 1, n):
+                    progress.set_description(f'estimating intersection ({i},{j})', refresh=False)
+                    progress.update()
+                    yield i, j
+
+    i, j = min(gen_indexes(), key=lambda x: solution_sets[x[0]].estimate_intersection_size(solution_sets[x[1]], random))
+    assert j > i  # pop the largest index first so smaller is still valid
+    a = solution_sets.pop(j)
+    b = solution_sets.pop(i)
+    solution_sets.append(a.intersection(b))
+    return solution_sets
 
 
 @dataclass(frozen=True)
@@ -945,7 +1147,7 @@ def draw_puzzle(ax: Optional[plt.Axes] = None, fig_size=11, fontsize=13, font='D
     return drawer
 
 
-def main():
+def old_main():
     from pprint import pprint
     strings = build_strings()
     for s in strings:
@@ -971,6 +1173,24 @@ def main():
     for solution in lazy_solutions.solutions:
         pprint(solution.cells)
         break
+
+
+def main():
+    print('building strings')
+    strings = build_strings()
+
+    from random import Random
+    Random(0xCAFE).shuffle(strings)
+    strings = strings[:10]
+
+    axes_solution_sets = defaultdict(list)
+    with tqdm(strings, desc='init solutions') as progress:
+        for s in progress:
+            axes_solution_sets[s.name[0]].append(SolutionSet.for_string(s))
+
+    solution_sets = merge_cross_axes_solution_sets(axes_solution_sets)
+    while len(solution_sets) > 1:
+        solution_sets = reduce_solution_sets_using_best_pair_intersections(solution_sets)
 
 
 __name__ == '__main__' and main()
