@@ -11,6 +11,7 @@ from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iter
 
 import matplotlib.pyplot as plt
 import numpy as np
+import numpy.random as np_random
 from matplotlib.collections import PatchCollection
 from matplotlib.markers import Path as MarkerPath
 from matplotlib.patches import FancyArrowPatch
@@ -30,6 +31,7 @@ def row_size(row_index: int) -> int:
 
 
 T = TypeVar('T')
+U = TypeVar('U')
 
 
 def or_else(x: Optional[T], e: T) -> T:
@@ -737,12 +739,13 @@ class Solution:
         return self._intersection(ixs_both, ixs_o, ixs_s, other) is not None
 
     def compute_intersection_sets(self, other: 'Solution'):
+        assert self is not other
         ixs_s = frozenset(self.cells)
         ixs_o = frozenset(other.cells)
-        ixs_both = ixs_s.intersection(ixs_o)
+        ixs_both = ixs_s & ixs_o
         return ixs_both, ixs_o, ixs_s
 
-    def _intersection(self, ixs_both, ixs_o, ixs_s, other):
+    def _intersection(self, ixs_both, ixs_o, ixs_s, other) -> Optional['Solution']:
         cells = {}
         for ix in ixs_both:
             c = self.cells[ix].intersection(other.cells[ix])
@@ -782,25 +785,108 @@ class Solution:
         return Solution(cells)
 
 
+@dataclass(frozen=True)
+class OptionallySizedIterable(Iterable[T]):
+    iterable: Iterable[T]
+    max_size: Optional[int]
+    known_size: Optional[int]
+
+    @classmethod
+    def of_known_size(cls, iterable: Iterable[T], n: int) -> 'OptionallySizedIterable[T]':
+        return cls(iterable, n, n)
+
+    @classmethod
+    def of_bound_size(cls, iterable: Iterable[T], max_size: int) -> 'OptionallySizedIterable[T]':
+        return cls(iterable, max_size, None)
+
+    @classmethod
+    def of_unbound(cls, iterable: Iterable[T]) -> 'OptionallySizedIterable[T]':
+        return cls(iterable, None, None)
+
+    @classmethod
+    def of(cls, iterable: Union['OptionallySizedIterable[T]', Iterable[T]]) -> 'OptionallySizedIterable[T]':
+        if isinstance(iterable, OptionallySizedIterable):
+            return iterable
+        if isinstance(iterable, Collection):
+            return cls.of_known_size(iterable, len(iterable))
+        assert isinstance(iterable, Iterable)
+        return cls.of_unbound(iterable)
+
+    @classmethod
+    def of_cartesian_product(cls, iterable: Iterable[T], x: 'OptionallySizedIterable', y: 'OptionallySizedIterable'
+                             ) -> 'OptionallySizedIterable[T]':
+        if x.has_known_size and y.has_known_size:
+            return cls.of_known_size(iterable, x.known_size * y.known_size)
+        if x.is_bound and y.is_bound:
+            return cls.of_bound_size(iterable, x.max_size * y.max_size)
+        return cls.of_unbound(iterable)
+
+    def __iter__(self) -> Iterator[T]:
+        return iter(OptionallySizedIterable)
+
+    @property
+    def is_bound(self) -> bool:
+        return self.max_size is not None
+
+    @property
+    def is_unbound(self) -> bool:
+        return self.max_size is None
+
+    @property
+    def has_known_size(self) -> bool:
+        return self.known_size is not None
+
+    @property
+    def len_str(self) -> str:
+        if self.is_unbound:
+            return 'unbound'
+        if self.has_known_size:
+            return f'={self.known_size}'
+        return f'<={self.max_size}'
+
+    def __str__(self):
+        return f'seq {self.len_str}'
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} {self.len_str}>'
+
+    def as_sequence(self) -> Sequence[T]:
+        assert self.is_bound
+        return self.iterable if isinstance(self.iterable, Sequence) else tuple(self.iterable)
+
+    def map(self, func: Callable[[T], U]) -> 'OptionallySizedIterable[U]':
+        return OptionallySizedIterable(map(func, self.iterable), self.max_size, self.known_size)
+
+    def filter(self, func: Callable[[T], bool]) -> 'OptionallySizedIterable[T]':
+        return OptionallySizedIterable(filter(func, self.iterable), self.max_size, None)
+
+
 class SolutionSet(Collection[Solution]):
     names: FrozenSet[str]
     cell_indices: FrozenSet[cell_ix_type]
-    solutions: Collection[Solution]
+    solutions: OptionallySizedIterable[Solution]
 
     def __init__(self,
                  names: FrozenSet[str],
                  cell_indices: FrozenSet[cell_ix_type],
-                 solutions: Collection[Solution]):
+                 solutions: Union[Iterable[Solution], OptionallySizedIterable[Solution]]):
         self.names = names
         self.cell_indices = cell_indices
-        self.solutions = solutions
+        self.solutions = OptionallySizedIterable.of(solutions)
 
     @property
     def names_str(self) -> str:
         return ', '.join(sorted(self.names))
 
+    def __str__(self) -> str:
+        return f'{self.names_str}(sols {self.solutions.len_str})'
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} {str(self)}>'
+
     def __len__(self) -> int:
-        return len(self.solutions)
+        assert self.solutions.has_known_size
+        return self.solutions.known_size
 
     def __iter__(self) -> Iterator[Solution]:
         return iter(self.solutions)
@@ -817,6 +903,9 @@ class SolutionSet(Collection[Solution]):
         if other.contains(self):
             return other
 
+        assert self.solutions.is_bound
+        assert other.solutions.is_bound
+
         solutions = []
         for a in self:
             for b in other:
@@ -824,6 +913,10 @@ class SolutionSet(Collection[Solution]):
                 if ab is not None:
                     solutions.append(ab)
 
+        return self.build_intersection(other, solutions)
+
+    def build_intersection(self, other: 'SolutionSet',
+                           solutions: Union[Iterable[Solution], OptionallySizedIterable[Solution]]):
         return SolutionSet(self.names | other.names, self.cell_indices | other.cell_indices, solutions)
 
     def cell_intersection(self, other: 'SolutionSet') -> FrozenSet[cell_ix_type]:
@@ -971,10 +1064,88 @@ def reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[Sol
     return solution_sets
 
 
-@dataclass(frozen=True)
-class SolutionSource:
-    name: str
-    solutions: Iterable[Solution]
+def multi_reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[SolutionSet], random: Random,
+                                                         max_reduce_size: int = 5000
+                                                         ) -> Collection[SolutionSet]:
+    too_large: List[SolutionSet] = []
+
+    def filter_to_large(sss: Collection[SolutionSet]) -> List[SolutionSet]:
+        too_large.extend(ss for ss in sss if len(ss) > max_reduce_size)
+        return [ss for ss in sss if len(ss) <= max_reduce_size]
+
+    solution_sets = filter_to_large(solution_sets)
+    while len(solution_sets) > 1:
+        solution_sets = reduce_solution_sets_by_lowest_estimated_count(solution_sets, random)
+        solution_sets = filter_to_large(solution_sets)
+
+    return solution_sets + too_large
+
+
+def iter_sequence_pair_indices(n: int) -> OptionallySizedIterable[Tuple[int, int]]:
+    def gen(n=n) -> Iterable[Tuple[int, int]]:
+        for i in range(n):
+            for j in range(i + 1, n):
+                yield i, j
+
+    return OptionallySizedIterable.of_known_size(gen(), n * (n - 1) // 2)
+
+
+def iter_sequence_pairs(xs: Sequence[T]) -> OptionallySizedIterable[Tuple[T, T]]:
+    return iter_sequence_pair_indices(len(xs)).map(lambda p: (xs[p[0]], xs[p[1]]))
+
+
+def iter_pairs_randomly_with_replacement(xs: Sequence[T], ys: Sequence[U],
+                                         random_state: Optional[Union[int, Random]] = None
+                                         ) -> OptionallySizedIterable[Tuple[T, U]]:
+    random: Random = random_state if isinstance(random_state, Random) else Random(random_state)
+
+    def gen(xs=xs, ys=ys) -> Iterable[Tuple[T, U]]:
+        nx = len(xs)
+        ny = len(ys)
+        randint = random.randint
+        while True:
+            yield xs[randint(0, nx)], ys[randint(0, ny)]
+
+    return OptionallySizedIterable.of_unbound(gen())
+
+
+def iter_pairs_randomly_wo_replacement(xs: Sequence[T], ys: Sequence[U],
+                                       random_state: Optional[Union[int, Random]] = None
+                                       ) -> OptionallySizedIterable[Tuple[T, U]]:
+    if isinstance(random_state, Random):
+        random_state = random_state.randrange(0, 0xFFFFFFFF)
+    random = np_random.RandomState(random_state)
+    nx = len(xs)
+    n = nx * len(ys)
+    indices = np.arange(0, n, dtype=np.int32)
+    random.shuffle(indices)
+
+    def gen(xs=xs, ys=ys) -> Iterable[Tuple[T, U]]:
+        for inx in indices:
+            j, i = divmod(inx, nx)
+            yield xs[i], ys[j]
+
+    return OptionallySizedIterable.of_known_size(gen(), n)
+
+
+def iter_pairs_randomly(xs: Sequence[T], ys: Sequence[U],
+                        random_state: Optional[Union[int, Random]] = None) -> OptionallySizedIterable[Tuple[T, U]]:
+    n = len(xs) * len(ys)
+    if n > 10_000_000:
+        return OptionallySizedIterable.of_unbound(
+            iter_pairs_randomly_with_replacement(xs, ys, random_state))
+    else:
+        return iter_pairs_randomly_wo_replacement(xs, ys, random_state)
+
+
+def stochastically_merge_solution_set_pair_bound(x: SolutionSet, y: SolutionSet, random: Random) -> SolutionSet:
+    pairs = iter_pairs_randomly_wo_replacement(x.solutions.as_sequence(), y.solutions.as_sequence(),
+                                               random_state=random)
+    assert pairs.is_bound, f'unbound pairs for {x} and {y}'
+    lazy_intersections = (pairs
+                          .map(lambda pair: pair[0].intersection(pair[1]))
+                          .filter(lambda s: s is not None))
+    return x.build_intersection(y, lazy_intersections)
 
 
 class RepeatableLazy(Iterable[T]):
@@ -1000,6 +1171,69 @@ class RepeatableLazy(Iterable[T]):
                 break
             yield n
             self.realized.append(n)
+
+
+def stochastically_merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSet) -> SolutionSet:
+    xs = x.solutions
+    ys = y.solutions
+    if xs.is_bound and (not ys.is_bound or xs.max_size < ys.max_size):
+        x, y = y, x
+        xs, ys = ys, xs
+    assert ys.is_bound, f'inner iterable is unbound for {y}'
+
+    def gen() -> Iterable[Solution]:
+        repeatable_ys = RepeatableLazy(iter(ys))
+        for xi in xs:
+            for yi in repeatable_ys:
+                xy = xi.intersection(yi)
+                if xy is not None:
+                    yield xy
+
+    lazy_intersections = (OptionallySizedIterable.of_bound_size(gen(), xs.max_size * ys.max_size)
+                          if xs.is_bound and ys.is_bound else
+                          OptionallySizedIterable.of_unbound(gen()))
+    return x.build_intersection(y, lazy_intersections)
+
+
+def stochastically_merge_solution_set_pair(x: SolutionSet, y: SolutionSet, random: Random,
+                                           max_known_size: int, max_bound_size: int) -> SolutionSet:
+    if x.contains(y):
+        return x
+    if y.contains(x):
+        return y
+    xs = x.solutions
+    ys = y.solutions
+    if ((xs.has_known_size and ys.has_known_size and xs.known_size * ys.known_size < max_known_size) or
+            (xs.is_bound and ys.is_bound and xs.max_size * ys.max_size < max_bound_size)):
+        return stochastically_merge_solution_set_pair_bound(x, y, random)
+    return stochastically_merge_solution_set_pair_unbound(x, y)
+
+
+def stochastically_merge_solution_sets(solution_sets: Collection[SolutionSet], random: Random,
+                                       max_known_size: int = 1_000_000,
+                                       max_bound_size: int = 200_000) -> Collection[SolutionSet]:
+    solution_sets = list(solution_sets)
+    n = len(solution_sets)
+    if n <= 1:
+        return solution_sets
+    estimated_overlaps = np.zeros((n, n), float)
+    iter_sequence_pair_indices(len(solution_sets))
+
+
+@dataclass(frozen=True)
+class SolutionSource:
+    name: str
+    solutions: Iterable[Solution]
+    max_size: int
+    known_size: Optional[int] = None
+
+    @classmethod
+    def of_unknown_size(cls, name: str, solutions: Iterable[Solution], max_size: int):
+        return cls(name, solutions, max_size, None)
+
+    @classmethod
+    def of_known_size(cls, name: str, solutions: Iterable[Solution], size: int):
+        return cls(name, solutions, size, size)
 
 
 def merge_two_solutions_seq(xs: SolutionSource, ys: SolutionSource, callback: Callable[[str, bool], Any]
