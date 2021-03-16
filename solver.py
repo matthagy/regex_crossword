@@ -2,12 +2,12 @@ import copy
 import sre_constants
 import sre_parse
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache, reduce
 from random import Random
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
-                    TypeVar, FrozenSet, Iterator)
+                    TypeVar, FrozenSet, Iterator, Mapping, Set)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -570,10 +570,6 @@ def build_strings() -> List[String]:
 
 class Constraint(ABC):
 
-    @classmethod
-    def for_chr(cls, chr: ReChr):
-        pass
-
     @abstractmethod
     def intersection(self, other: 'Constraint') -> Optional['Constraint']:
         pass
@@ -582,15 +578,25 @@ class Constraint(ABC):
     def label(self) -> str:
         pass
 
+    @property
+    @abstractmethod
+    def has_references(self) -> bool:
+        pass
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} {self}>'
+
+    def __str__(self) -> str:
+        return self.label()
+
 
 class AnyConstraint(Constraint):
+    _instance: Optional['AnyConstraint'] = None
 
     def __new__(cls) -> Any:
-        global any_constraint
-        try:
-            return any_constraint
-        except NameError:
-            return super().__new__(cls)
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
     def intersection(self, other: Constraint) -> Constraint:
         return other
@@ -598,16 +604,15 @@ class AnyConstraint(Constraint):
     def label(self) -> str:
         return '.'
 
+    @property
+    def has_references(self) -> bool:
+        return False
 
-# Need for reloading
-try:
-    del any_constraint
-except NameError:
-    pass
+
 any_constraint = AnyConstraint()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class LiteralConstraint(Constraint):
     chars: FrozenSet[str]
     negate: bool
@@ -655,8 +660,12 @@ class LiteralConstraint(Constraint):
     def for_re_lit(cls, chr: ReLit) -> 'LiteralConstraint':
         return cls(frozenset(chr.chars), chr.negate)
 
+    @property
+    def has_references(self) -> bool:
+        return False
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, repr=False)
 class RefConstraint(Constraint):
     indices: FrozenSet[cell_ix_type]
 
@@ -676,8 +685,12 @@ class RefConstraint(Constraint):
     def label(self) -> str:
         return ', '.join('%d,%d' % x for x in sorted(self.indices))
 
+    @property
+    def has_references(self) -> bool:
+        return True
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, repr=False)
 class CompoundConstraint(Constraint):
     lit_constraint: LiteralConstraint
     ref_constraint: RefConstraint
@@ -695,6 +708,10 @@ class CompoundConstraint(Constraint):
 
     def label(self) -> str:
         return self.lit_constraint.label() + ' : ' + self.ref_constraint.label()
+
+    @property
+    def has_references(self) -> bool:
+        return True
 
 
 class Solution:
@@ -885,6 +902,9 @@ class SolutionSet(Collection[Solution]):
     def names_str(self) -> str:
         return ', '.join(sorted(self.names))
 
+    def contains(self, other: 'SolutionSet') -> bool:
+        return self.names >= other.names
+
     def __str__(self) -> str:
         return f'{self.names_str} cells={len(self.cell_indices)} (sols {self.solutions.len_str})'
 
@@ -900,9 +920,6 @@ class SolutionSet(Collection[Solution]):
 
     def __contains__(self, x: object) -> bool:
         raise NotImplementedError()
-
-    def contains(self, other: 'SolutionSet') -> bool:
-        return self.names >= other.names
 
     def intersection(self, other: 'SolutionSet') -> 'SolutionSet':
         if self.contains(other):
@@ -1240,6 +1257,419 @@ def stochastically_merge_solution_sets(solution_sets: Collection[SolutionSet], r
                   sorted(solution_sets, key=len))
 
 
+@dataclass(frozen=True)
+class Dimension:
+    name: str
+    size: int
+
+    def __str__(self):
+        return f'{self.name}({self.size})'
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self}>'
+
+
+class DimensionSolutions(ABC):
+
+    @abstractmethod
+    def size(self, dimension: Dimension) -> int:
+        pass
+
+    @abstractmethod
+    def intersection(self, other: 'DimensionSolutions') -> 'DimensionSolutions':
+        pass
+
+    @abstractmethod
+    def union(self, other: 'DimensionSolutions') -> 'DimensionSolutions':
+        pass
+
+    @abstractmethod
+    def optimize(self, dimension: Dimension) -> 'DimensionSolutions':
+        pass
+
+    @staticmethod
+    def for_dimension(dim: Dimension, indices: Collection[int]):
+        if len(indices) == dim.size:
+            return dimension_all
+        if len(indices) > dim.size // 2:
+            return DimensionSolutionIndexes(frozenset(range(dim.size)) - frozenset(indices), negate=True)
+        else:
+            return DimensionSolutionIndexes(frozenset(indices), negate=False)
+
+
+class DimensionSolutionAll(DimensionSolutions):
+    _instance: Optional['DimensionSolutionAll'] = None
+
+    def __new__(cls) -> Any:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__}>'
+
+    def intersection(self, other: DimensionSolutions) -> DimensionSolutions:
+        return other
+
+    def union(self, other: DimensionSolutions) -> DimensionSolutions:
+        return self
+
+    def size(self, dimension: Dimension) -> int:
+        return dimension.size
+
+    def optimize(self, dimension: Dimension) -> DimensionSolutions:
+        return self
+
+
+dimension_all: DimensionSolutions = DimensionSolutionAll()
+
+
+class DimensionSolutionIndexes(DimensionSolutions):
+    indexes: FrozenSet[int]
+    negate: bool
+
+    def __init__(self, solutions: FrozenSet[int], negate: bool = False):
+        self.indexes = solutions
+        self.negate = negate
+
+    def __str__(self):
+        return f'{"-" if self.negate else "+"}({len(self.indexes)})'
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self}>'
+
+    def intersection(self, other: DimensionSolutions) -> DimensionSolutions:
+        if other is dimension_all:
+            return self
+        assert isinstance(other, DimensionSolutionIndexes)
+        if self.negate == other.negate:
+            return DimensionSolutionIndexes(
+                self.indexes | other.indexes if self.negate else self.indexes & other.indexes,
+                self.negate)
+        pos, neg = self, other
+        if pos.negate:
+            pos, neg = neg, pos
+        return DimensionSolutionIndexes(pos.indexes - neg.indexes, False)
+
+    def union(self, other: DimensionSolutions) -> DimensionSolutions:
+        if other is dimension_all:
+            return self
+        assert isinstance(other, DimensionSolutionIndexes)
+        if self.negate == other.negate:
+            return DimensionSolutionIndexes(
+                self.indexes & other.indexes if self.negate else self.indexes | other.indexes,
+                self.negate)
+        pos, neg = self, other
+        if pos.negate:
+            pos, neg = neg, pos
+        return DimensionSolutionIndexes(neg.indexes - pos.indexes, True)
+
+    def size(self, dimension: Dimension) -> int:
+        return dimension.size - len(self.indexes) if self.negate else len(self.indexes)
+
+    def optimize(self, dim: Dimension) -> DimensionSolutions:
+        if len(self.indexes) == dim.size:
+            return dimension_all
+        if len(self.indexes) > dim.size // 2:
+            return DimensionSolutionIndexes(frozenset(range(dim.size)) - self.indexes, negate=not self.negate)
+        return self
+
+
+class DimensionCombination:
+    dimensions: Mapping[Dimension, DimensionSolutions]
+
+    def __init__(self, dimensions: Mapping[Dimension, DimensionSolutions]):
+        self.dimensions = dimensions
+
+    def size(self) -> int:
+        if not self.dimensions:
+            return 0
+        sz = 1
+        for dim, cell in self.dimensions.items():
+            c_sz = cell.size(dim)
+            if c_sz == 0:
+                return 0
+            sz *= c_sz
+        return sz
+
+    def intersection(self, other: 'DimensionCombination') -> 'DimensionCombination':
+        return self._merge(other, lambda a, b: a.intersection(b))
+
+    def union(self, other: 'DimensionCombination') -> 'DimensionCombination':
+        return self._merge(other, lambda a, b: a.union(b))
+
+    def _merge(self, other: 'DimensionCombination',
+               merger: Callable[[DimensionSolutions, DimensionSolutions], DimensionSolutions]
+               ) -> 'DimensionCombination':
+        dimensions: Dict[Dimension, DimensionSolutions] = {}
+        common = self.dimensions.keys() & other.dimensions.keys()
+        for dim in common:
+            dimensions[dim] = merger(self.dimensions[dim], other.dimensions[dim])
+        for dim in self.dimensions.keys() - common:
+            dimensions[dim] = self.dimensions[dim]
+        for dim in other.dimensions.keys() - common:
+            dimensions[dim] = other.dimensions[dim]
+        return DimensionCombination(dimensions)
+
+    @classmethod
+    def for_dimension(cls, dim: Dimension, indices: Collection[int]):
+        return cls({dim: DimensionSolutions.for_dimension(dim, indices)})
+
+    def optimize(self) -> 'DimensionCombination':
+        return DimensionCombination({dim: sol.optimize(dim) for dim, sol in self.dimensions.items()})
+
+    def add_dimensions_all(self, dims: FrozenSet[Dimension]) -> 'DimensionCombination':
+        cp = dict(self.dimensions)
+        for dim in dims:
+            assert dim not in cp, f'{dim} in {cp}'
+            cp[dim] = dimension_all
+        return DimensionCombination(cp)
+
+
+@dataclass(frozen=True)
+class DimensionCombinationAndReferences:
+    combination: DimensionCombination
+    references: FrozenSet[cell_ix_type] = frozenset([])
+    include_without_references: bool = False
+
+    def union(self, other: 'DimensionCombinationAndReferences') -> 'DimensionCombinationAndReferences':
+        return DimensionCombinationAndReferences(self.combination.union(other.combination),
+                                                 self.references | other.references,
+                                                 self.include_without_references or other.include_without_references)
+
+    def create_constraints(self, lit_con: Optional[LiteralConstraint]) -> Collection[Constraint]:
+        if not self.references:
+            assert lit_con is not None
+            return [lit_con]
+        ref_con = RefConstraint(self.references)
+        if lit_con is None:
+            return [ref_con]
+        cc = CompoundConstraint(lit_con, ref_con)
+        return [cc, lit_con] if self.include_without_references else [cc]
+
+    def create_items(self, lit_con: Optional[LiteralConstraint]) -> Collection[Tuple[Constraint, DimensionCombination]]:
+        return [(con, self.combination) for con in self.create_constraints(lit_con)]
+
+
+class ConstraintDimensionCombination:
+    any_combinations: Optional[DimensionCombination] = None
+    bare_references: Optional[DimensionCombinationAndReferences] = None
+    literal_constraints: Dict[LiteralConstraint, DimensionCombinationAndReferences]
+
+    def __init__(self):
+        self.literal_constraints = {}
+
+    def add(self, constraint: Constraint, combination: DimensionCombination):
+        if constraint is any_constraint:
+            if self.any_combinations is not None:
+                combination = self.any_combinations.union(combination)
+            self.any_combinations = combination
+            return
+
+        if isinstance(constraint, RefConstraint):
+            dcr = DimensionCombinationAndReferences(combination, constraint.indices)
+            if self.bare_references is not None:
+                dcr = self.bare_references.union(dcr)
+            self.bare_references = dcr
+            return
+
+        lit_con: LiteralConstraint
+        references: FrozenSet[cell_ix_type]
+        include_without_references: bool
+        if isinstance(constraint, LiteralConstraint):
+            lit_con = constraint
+            references = frozenset([])
+            include_without_references = True
+        else:
+            assert isinstance(constraint, CompoundConstraint)
+            lit_con = constraint.lit_constraint
+            references = constraint.ref_constraint.indices
+            include_without_references = False
+        dcr = DimensionCombinationAndReferences(combination, references, include_without_references)
+        existing = self.literal_constraints.get(lit_con)
+        if existing is not None:
+            dcr = existing.union(dcr)
+        self.literal_constraints[lit_con] = dcr
+
+    def add_all(self, other: 'ConstraintDimensionCombination'):
+        assert self is not other
+        for con, comb in other.items():
+            self.add(con, comb)
+
+    def items(self) -> Sequence[Tuple[Constraint, DimensionCombination]]:
+        items: List[Tuple[Constraint, DimensionCombination]] = []
+        if self.any_combinations is not None and self.any_combinations.size():
+            items.append((any_constraint, self.any_combinations))
+        if self.bare_references is not None and self.bare_references.combination.size():
+            items.extend(self.bare_references.create_items(None))
+        for lit_con, dcr in self.literal_constraints.items():
+            if dcr.combination.size():
+                items.extend(dcr.create_items(lit_con))
+        return items
+
+    def __bool__(self):
+        if self.any_combinations is not None and self.any_combinations.size():
+            return True
+        if self.bare_references is not None and self.bare_references.combination.size():
+            return True
+        return any(dcr.combination.size() for dcr in self.literal_constraints.values())
+
+
+class CellConstraints:
+    constraint_dimensions: Sequence[Tuple[Constraint, DimensionCombination]]
+
+    def __init__(self, constraints: Sequence[Tuple[Constraint, DimensionCombination]]):
+        self.constraint_dimensions = constraints
+
+    def intersection(self, other: 'CellConstraints') -> Optional['CellConstraints']:
+        int_combs = ConstraintDimensionCombination()
+        for con_a, comb_a in self.constraint_dimensions:
+            for con_b, comb_b in other.constraint_dimensions:
+                con_ab = con_a.intersection(con_b)
+                if con_ab is None:
+                    continue
+                comb_ab = comb_a.intersection(comb_b)
+                if not comb_ab.size():
+                    continue
+                int_combs.add(con_ab, comb_ab)
+        return None if not int_combs else CellConstraints(int_combs.items())
+
+    def add_dimensions_all(self, dims: FrozenSet[Dimension]) -> 'CellConstraints':
+        if not dims:
+            return self
+        return CellConstraints(tuple((con, comb.add_dimensions_all(dims))
+                                     for con, comb in self.constraint_dimensions))
+
+    @property
+    def has_references(self) -> bool:
+        return any(c.has_references for c, _ in self.constraint_dimensions)
+
+    def get_references(self) -> Set[cell_ix_type]:
+        refs = set()
+        for c, _ in self.constraint_dimensions:
+            if c.has_references:
+                if isinstance(c, RefConstraint):
+                    refs.update(c.indices)
+                else:
+                    assert isinstance(c, CompoundConstraint)
+                    refs.update(c.ref_constraint.indices)
+        return refs
+
+    def apply_references(self, cells: Mapping[cell_ix_type, 'CellConstraints']) -> Optional['CellConstraints']:
+        applied = ConstraintDimensionCombination()
+        for con, comb in self.constraint_dimensions:
+            if not con.has_references:
+                applied.add(con, comb)
+                continue
+
+            ref_con: RefConstraint
+            lit_con: Optional[LiteralConstraint]
+            if isinstance(con, RefConstraint):
+                ref_con = con
+                lit_con = None
+            else:
+                assert isinstance(con, CompoundConstraint)
+                ref_con = con.ref_constraint
+                lit_con = con.lit_constraint
+            applied.add_all(self.resolve_references(cells, comb, ref_con, lit_con))
+
+        return None if not applied else CellConstraints(applied.items())
+
+    @staticmethod
+    def resolve_references(cells: Mapping[cell_ix_type, 'CellConstraints'],
+                           comb: DimensionCombination, ref_con: RefConstraint,
+                           lit_con: Optional[LiteralConstraint]) -> ConstraintDimensionCombination:
+        int_combs = ConstraintDimensionCombination()
+        for ix in ref_con.indices:
+            for refed_con, refed_comb in cells[ix].constraint_dimensions:
+                if lit_con is not None:
+                    refed_con = refed_con.intersection(lit_con)
+                    if refed_con is None:
+                        continue
+                ref_int = ref_con.intersection(refed_con)
+                assert ref_int is not None
+                int_combs.add(ref_int, refed_comb.intersection(comb))
+        return int_combs
+
+    def optimize(self) -> 'CellConstraints':
+        return CellConstraints(tuple((con, comb.optimize()) for con, comb in self.constraint_dimensions))
+
+    @classmethod
+    def for_dimension(cls, dim: Dimension, constraints: Dict[Constraint, List[int]]):
+        return cls(tuple((con, DimensionCombination.for_dimension(dim, indices))
+                         for con, indices in constraints.items()))
+
+
+class SparseSolutionSet:
+    dimensions: FrozenSet[Dimension]
+    cells: Mapping[cell_ix_type, CellConstraints]
+
+    def __init__(self, dimensions: FrozenSet[Dimension],
+                 cells: Mapping[cell_ix_type, CellConstraints]) -> None:
+        self.dimensions = dimensions
+        self.cells = cells
+
+    @property
+    def names_str(self) -> str:
+        return ', '.join(sorted(self.dimensions))
+
+    def contains(self, other: 'SparseSolutionSet') -> bool:
+        return self.dimensions >= other.dimensions
+
+    def intersection(self, other: 'SparseSolutionSet') -> Optional['SparseSolutionSet']:
+        if self.contains(other):
+            return self
+        if other.contains(self):
+            return other
+
+        cells: Dict[cell_ix_type, CellConstraints] = {}
+        common = self.cells.keys() & other.cells.keys()
+        for ix in common:
+            c = self.cells[ix].intersection(other.cells[ix])
+            if c is None:
+                return None
+            cells[ix] = c
+        dims_s = self.dimensions - other.dimensions
+        dims_o = other.dimensions - self.dimensions
+        for ix in self.cells.keys() - common:
+            cells[ix] = self.cells[ix].add_dimensions_all(dims_o)
+        for ix in other.cells.keys() - common:
+            cells[ix] = other.cells[ix].add_dimensions_all(dims_s)
+
+        @lru_cache(len(cells))
+        def apply_constraints(cell_ix: cell_ix_type) -> Optional[CellConstraints]:
+            cc = cells[cell_ix]
+            assert cc.has_references
+            for ref in cc.get_references():
+                refed = cells[ref]
+                if refed.has_references:
+                    if apply_constraints(ref) is None:
+                        return None
+
+            return cc.apply_references(cells)
+
+        for ix, c in cells.items():
+            if c.has_references:
+                ac = apply_constraints(ix)
+                if ac is None:
+                    return None
+                cells[ix] = c
+
+        return SparseSolutionSet(self.dimensions | other.dimensions, cells)
+
+    @classmethod
+    def for_string(cls, s: String) -> 'SparseSolutionSet':
+        solutions = list(Solution.generate_solutions(s))
+        cells: Dict[cell_ix_type, Dict[Constraint, List[int]]] = defaultdict(lambda: defaultdict(list))
+        for sol_i, solution in enumerate(solutions):
+            for ix, con in solution.cells.items():
+                cells[ix][con].append(sol_i)
+
+        dim = Dimension(s.name, len(solutions))
+        return cls(frozenset([dim]), {ix: CellConstraints.for_dimension(dim, cons)
+                                      for ix, cons in cells.items()})
+
+
 class PuzzleDrawer:
     ax: plt.Axes
     fontsize: int = 13
@@ -1356,7 +1786,7 @@ def draw_puzzle(ax: Optional[plt.Axes] = None, fig_size=11, fontsize=13, font='D
     return drawer
 
 
-def main():
+def old_main():
     print('building strings')
     strings = build_strings()
 
@@ -1384,6 +1814,36 @@ def main():
         solution = next(iter(solutions))
 
     print(solution)
+
+
+def main():
+    from pprint import pprint
+
+    print('building strings')
+    strings = build_strings()
+
+    def show(sol: SparseSolutionSet):
+        pprint({ix: [[con, comb.dimensions]
+                     for con, comb in cc.constraint_dimensions]
+                for ix, cc in sol.cells.items()})
+
+    # a = SparseSolutionSet.for_string(strings[0])
+    # b = SparseSolutionSet.for_string(strings[13])
+    #
+    # show(a)
+    # show(b)
+    # i = a.intersection(b)
+    # show(i)
+
+    random = Random(0xCAFE)
+    random.shuffle(strings)
+    # strings = strings[:20]
+
+    with tqdm(strings, desc='init solutions') as progress:
+        solution_sets = [SparseSolutionSet.for_string(s) for s in progress]
+
+    s = reduce(lambda a, b: a.intersection(b), solution_sets)
+    show(s)
 
 
 __name__ == '__main__' and main()
