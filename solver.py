@@ -2,9 +2,9 @@ import copy
 import sre_constants
 import sre_parse
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, reduce
 from random import Random
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
                     TypeVar, FrozenSet, Iterator)
@@ -728,6 +728,9 @@ class Solution:
         for match in string.gen_possible():
             yield cls.for_chr_seq(string, match.chr_seq)
 
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} cells={len(self.cells)}>'
+
     def intersection(self, other: 'Solution') -> Optional['Solution']:
         ixs_both, ixs_o, ixs_s = self.compute_intersection_sets(other)
         return self._intersection(ixs_both, ixs_o, ixs_s, other)
@@ -822,7 +825,7 @@ class OptionallySizedIterable(Iterable[T]):
         return cls.of_unbound(iterable)
 
     def __iter__(self) -> Iterator[T]:
-        return iter(OptionallySizedIterable)
+        return iter(self.iterable)
 
     @property
     def is_bound(self) -> bool:
@@ -841,8 +844,12 @@ class OptionallySizedIterable(Iterable[T]):
         if self.is_unbound:
             return 'unbound'
         if self.has_known_size:
-            return f'={self.known_size}'
-        return f'<={self.max_size}'
+            return f'={self._len_str(self.known_size)}'
+        return f'<={self._len_str(self.max_size)}'
+
+    @staticmethod
+    def _len_str(n: int) -> str:
+        return f'{n:,}' if n < 1e9 else f'{n:.1e}'
 
     def __str__(self):
         return f'seq {self.len_str}'
@@ -879,7 +886,7 @@ class SolutionSet(Collection[Solution]):
         return ', '.join(sorted(self.names))
 
     def __str__(self) -> str:
-        return f'{self.names_str}(sols {self.solutions.len_str})'
+        return f'{self.names_str} cells={len(self.cell_indices)} (sols {self.solutions.len_str})'
 
     def __repr__(self) -> str:
         return f'<{self.__class__.__name__} {str(self)}>'
@@ -945,10 +952,10 @@ class SolutionSet(Collection[Solution]):
         return intersection_rate * (len(self) * len(other))
 
     @classmethod
-    def for_string(cls, s: String):
-        return cls(frozenset([s.name]),
-                   frozenset(p.cell.index for p in s.positions),
-                   tuple(Solution.generate_solutions(s)))
+    def for_string(cls, s: String, random: Random):
+        solutions = list(Solution.generate_solutions(s))
+        random.shuffle(solutions)
+        return cls(frozenset([s.name]), frozenset(p.cell.index for p in s.positions), solutions)
 
 
 def select_smallest_solution_set(solution_sets: Iterable[SolutionSet]) -> SolutionSet:
@@ -990,7 +997,7 @@ def merge_cross_axes_solution_sets(axes_solution_sets: Dict[str, Collection[Solu
             other_axes_solutions = [other_solution for other_axis in axes - {axis}
                                     for other_solution in axes_solution_sets[other_axis]]
             for axis_solution in axis_solutions:
-                progress.set_description(f'merge cross axis {axis_solution.names_str} sz={len(axis_solution)}')
+                progress.set_description(f'merge cross axis {axis_solution}')
                 progress.update()
                 intersections.append(select_smallest_solution_set(intersection(axis_solution, p)
                                                                   for p in other_axes_solutions))
@@ -1009,8 +1016,7 @@ def reduce_solution_sets_using_best_pair_intersections(solution_sets: Collection
             def gen_intersections() -> Iterable[SolutionSet]:
                 for other in solution_sets:
                     if other is not solution_set:
-                        progress.set_description(f'reduce {solution_set.names_str} n={len(solution_set)} & ' +
-                                                 f'{other.names_str} n={len(other)}')
+                        progress.set_description(f'reduce {solution_set} & {other}')
                         yield intersection(solution_set, other)
 
             intersections.append(select_smallest_solution_set(gen_intersections()))
@@ -1065,7 +1071,7 @@ def reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[Sol
 
 
 def multi_reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[SolutionSet], random: Random,
-                                                         max_reduce_size: int = 5000
+                                                         max_reduce_size: int = 2000
                                                          ) -> Collection[SolutionSet]:
     too_large: List[SolutionSet] = []
 
@@ -1138,13 +1144,23 @@ def iter_pairs_randomly(xs: Sequence[T], ys: Sequence[U],
         return iter_pairs_randomly_wo_replacement(xs, ys, random_state)
 
 
-def stochastically_merge_solution_set_pair_bound(x: SolutionSet, y: SolutionSet, random: Random) -> SolutionSet:
+def stochastically_merge_solution_set_pair_bound(
+        x: SolutionSet, y: SolutionSet, random: Random,
+        callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
     pairs = iter_pairs_randomly_wo_replacement(x.solutions.as_sequence(), y.solutions.as_sequence(),
                                                random_state=random)
     assert pairs.is_bound, f'unbound pairs for {x} and {y}'
-    lazy_intersections = (pairs
-                          .map(lambda pair: pair[0].intersection(pair[1]))
-                          .filter(lambda s: s is not None))
+
+    nx = str(x)
+    ny = str(y)
+
+    def mapper(pair: Tuple[Solution, Solution]) -> Optional[Solution]:
+        xi, yi = pair
+        xy = xi.intersection(yi)
+        callback(nx, ny, xy)
+        return xy
+
+    lazy_intersections = pairs.map(mapper).filter(lambda s: s is not None)
     return x.build_intersection(y, lazy_intersections)
 
 
@@ -1173,7 +1189,8 @@ class RepeatableLazy(Iterable[T]):
             self.realized.append(n)
 
 
-def stochastically_merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSet) -> SolutionSet:
+def merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSet,
+                                    callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
     xs = x.solutions
     ys = y.solutions
     if xs.is_bound and (not ys.is_bound or xs.max_size < ys.max_size):
@@ -1183,9 +1200,12 @@ def stochastically_merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSe
 
     def gen() -> Iterable[Solution]:
         repeatable_ys = RepeatableLazy(iter(ys))
+        nx = str(x)
+        ny = str(y)
         for xi in xs:
             for yi in repeatable_ys:
                 xy = xi.intersection(yi)
+                callback(nx, ny, xy)
                 if xy is not None:
                     yield xy
 
@@ -1195,8 +1215,10 @@ def stochastically_merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSe
     return x.build_intersection(y, lazy_intersections)
 
 
-def stochastically_merge_solution_set_pair(x: SolutionSet, y: SolutionSet, random: Random,
-                                           max_known_size: int, max_bound_size: int) -> SolutionSet:
+def stochastically_merge_solution_set_pair(
+        x: SolutionSet, y: SolutionSet, random: Random,
+        max_known_size: int, max_bound_size: int,
+        callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
     if x.contains(y):
         return x
     if y.contains(x):
@@ -1205,64 +1227,17 @@ def stochastically_merge_solution_set_pair(x: SolutionSet, y: SolutionSet, rando
     ys = y.solutions
     if ((xs.has_known_size and ys.has_known_size and xs.known_size * ys.known_size < max_known_size) or
             (xs.is_bound and ys.is_bound and xs.max_size * ys.max_size < max_bound_size)):
-        return stochastically_merge_solution_set_pair_bound(x, y, random)
-    return stochastically_merge_solution_set_pair_unbound(x, y)
+        return stochastically_merge_solution_set_pair_bound(x, y, random, callback)
+    return merge_solution_set_pair_unbound(x, y, callback)
 
 
 def stochastically_merge_solution_sets(solution_sets: Collection[SolutionSet], random: Random,
+                                       callback: Callable[[str, str, Optional[Solution]], Any],
                                        max_known_size: int = 1_000_000,
-                                       max_bound_size: int = 200_000) -> Collection[SolutionSet]:
-    solution_sets = list(solution_sets)
-    n = len(solution_sets)
-    if n <= 1:
-        return solution_sets
-    estimated_overlaps = np.zeros((n, n), float)
-    iter_sequence_pair_indices(len(solution_sets))
-
-
-@dataclass(frozen=True)
-class SolutionSource:
-    name: str
-    solutions: Iterable[Solution]
-    max_size: int
-    known_size: Optional[int] = None
-
-    @classmethod
-    def of_unknown_size(cls, name: str, solutions: Iterable[Solution], max_size: int):
-        return cls(name, solutions, max_size, None)
-
-    @classmethod
-    def of_known_size(cls, name: str, solutions: Iterable[Solution], size: int):
-        return cls(name, solutions, size, size)
-
-
-def merge_two_solutions_seq(xs: SolutionSource, ys: SolutionSource, callback: Callable[[str, bool], Any]
-                            ) -> SolutionSource:
-    name = f'{xs.name} & {ys.name}'
-
-    def gen() -> Iterable[Solution]:
-        yl = RepeatableLazy(iter(ys.solutions))
-        for x in xs.solutions:
-            for y in yl:
-                i = y.intersection(x)
-                if i is None:
-                    callback(name, False)
-                else:
-                    callback(name, True)
-                    yield i
-
-    return SolutionSource(name, gen())
-
-
-def merge_many_solutions(sol_seqs: Iterable[SolutionSource],
-                         callback: Callable[[str, bool], Any]) -> SolutionSource:
-    acc: Optional[SolutionSource] = None
-    for sol in sol_seqs:
-        if acc is None:
-            acc = sol
-        else:
-            acc = merge_two_solutions_seq(acc, sol, callback)
-    return SolutionSource('', []) if acc is None else acc
+                                       max_bound_size: int = 200_000) -> SolutionSet:
+    return reduce(lambda x, y: stochastically_merge_solution_set_pair(x, y, random,
+                                                                      max_known_size, max_bound_size, callback),
+                  sorted(solution_sets, key=len))
 
 
 class PuzzleDrawer:
@@ -1381,50 +1356,34 @@ def draw_puzzle(ax: Optional[plt.Axes] = None, fig_size=11, fontsize=13, font='D
     return drawer
 
 
-def old_main():
-    from pprint import pprint
-    strings = build_strings()
-    for s in strings:
-        print(s.pattern.raw, s.size)
-        for m in s.gen_possible():
-            print(' ', m.chr_seq)
-        print('-' * 60)
-
-    strings.sort(key=lambda st: st.size)
-
-    strings = strings[:5:]
-
-    i = 0
-
-    def callback(name, res):
-        nonlocal i
-        i += 1
-        if i % 50 == 0:
-            print(('no', '  ')[res], 'match', name)
-
-    lazy_solutions = merge_many_solutions((SolutionSource(f'{s.pattern.raw}={s.size}', Solution.generate_solutions(s))
-                                           for s in strings), callback)
-    for solution in lazy_solutions.solutions:
-        pprint(solution.cells)
-        break
-
-
 def main():
     print('building strings')
     strings = build_strings()
 
-    from random import Random
-    Random(0xCAFE).shuffle(strings)
-    strings = strings[:10]
+    random = Random(0xCAFE)
+    random.shuffle(strings)
+    # strings = strings[:16]
 
-    axes_solution_sets = defaultdict(list)
     with tqdm(strings, desc='init solutions') as progress:
-        for s in progress:
-            axes_solution_sets[s.name[0]].append(SolutionSet.for_string(s))
+        solution_sets = [SolutionSet.for_string(s, random) for s in progress]
 
-    solution_sets = merge_cross_axes_solution_sets(axes_solution_sets)
-    while len(solution_sets) > 1:
-        solution_sets = reduce_solution_sets_using_best_pair_intersections(solution_sets)
+    solution_sets = multi_reduce_solution_sets_by_lowest_estimated_count(solution_sets, random)
+    print(f'post estimation {len(solution_sets)} solutions')
+
+    i = 0
+    with tqdm() as progress:
+        def callback(xi, yi, xy):
+            nonlocal i
+            i += 1
+            if i % 10 == 0:
+                progress.set_description(('no', '  ')[xy is not None] + f'match {xi} & {yi}', refresh=False)
+                progress.update()
+
+        solutions = stochastically_merge_solution_sets(solution_sets, random=random, callback=callback)
+        print(solutions)
+        solution = next(iter(solutions))
+
+    print(solution)
 
 
 __name__ == '__main__' and main()
