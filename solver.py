@@ -5,13 +5,11 @@ from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache, reduce, total_ordering
-from random import Random
 from typing import (Any, Callable, Dict, List, Tuple, Optional, Collection, Iterable, Sequence, Union, overload,
-                    TypeVar, FrozenSet, Iterator, Mapping, Set)
+                    TypeVar, FrozenSet, Iterator, Mapping, Set, ValuesView, AbstractSet)
 
 import matplotlib.pyplot as plt
 import numpy as np
-import numpy.random as np_random
 from matplotlib.collections import PatchCollection
 from matplotlib.markers import Path as MarkerPath
 from matplotlib.patches import FancyArrowPatch
@@ -32,10 +30,73 @@ def row_size(row_index: int) -> int:
 
 T = TypeVar('T')
 U = TypeVar('U')
+K = TypeVar('K')
+V = TypeVar('V')
 
 
 def or_else(x: Optional[T], e: T) -> T:
     return x if x is not None else e
+
+
+class FrozenDict(Mapping[K, V]):
+    _d: Mapping[K, V]
+    _h: Optional[int] = None
+
+    def __init__(self, d: Mapping[K, V]) -> None:
+        self._d = d
+
+    def __new__(cls, d: Mapping[K, V]) -> 'FrozenDict[K, V]':
+        if isinstance(d, FrozenDict):
+            return d
+        if not isinstance(d, Mapping):
+            d = dict(d)
+        fd = super().__new__(cls)
+        fd.__init__(d)
+        return fd
+
+    def __eq__(self, o: object) -> bool:
+        if self is o:
+            return True
+        if isinstance(o, FrozenDict):
+            return o._d == self._d
+        if isinstance(0, Mapping):
+            return o == self._d
+        return False
+
+    def __hash__(self) -> int:
+        if self._h is None:
+            self._h = hash(tuple(sorted(self._d.items())))
+        return self._h
+
+    def __repr__(self) -> str:
+        return f'<{self.__class__.__name__} {self}>'
+
+    def __str__(self) -> str:
+        return str(self._d)
+
+    def __getitem__(self, k: K) -> V:
+        return self._d[k]
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def __iter__(self) -> Iterator[K]:
+        return iter(self._d)
+
+    def get(self, key: K, value: Optional[T] = None) -> Union[V, Optional[T]]:
+        return self._d.get(key, value)
+
+    def items(self) -> AbstractSet[Tuple[K, V]]:
+        return self._d.items()
+
+    def keys(self) -> AbstractSet[K]:
+        return self._d.keys()
+
+    def values(self) -> ValuesView[V]:
+        return self._d.values()
+
+    def __contains__(self, o: object) -> bool:
+        return o in self._d
 
 
 @dataclass(frozen=True)
@@ -172,7 +233,7 @@ class Re(ABC):
         pass
 
     @classmethod
-    def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, 'Re']) -> 'Re':
+    def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, 'Re']) -> 'Re':
         return cls.op_converters[op](op, arg, groups)
 
 
@@ -323,12 +384,12 @@ class ReSeq(Re):
     @classmethod
     def from_op_args(cls,
                      ops_args: Iterable[Tuple[int, Any]],
-                     groups: Dict[int, 'ReSeq'],
+                     groups: Mapping[int, 'ReSeq'],
                      index: Optional[int] = None) -> 'ReSeq':
         return cls(res=tuple(Re.from_op_arg(op, arg, groups) for op, arg in ops_args), index=index)
 
     @classmethod
-    def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, 'ReSeq']) -> 'ReSeq':
+    def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, 'ReSeq']) -> 'ReSeq':
         assert op == sre_constants.SUBPATTERN
         index, add_flags, del_flags, p = arg
         assert index not in groups
@@ -375,7 +436,7 @@ class ReGroupRef(Re):
             yield possible_match(chr_seq, state)
 
     @classmethod
-    def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, ReSeq]) -> 'ReGroupRef':
+    def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, ReSeq]) -> 'ReGroupRef':
         assert op == sre_constants.GROUPREF
         assert isinstance(arg, int)
         return cls(groups[arg])
@@ -418,7 +479,7 @@ class ReRepeat(Re):
         yield from rec(0, [possible_match(empty_chr_seq, state)])
 
     @classmethod
-    def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, ReSeq]) -> 'ReRepeat':
+    def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, ReSeq]) -> 'ReRepeat':
         assert op == sre_constants.MAX_REPEAT
         mn, mx, p = arg
         if mx == sre_constants.MAXREPEAT:
@@ -444,7 +505,7 @@ class ReBranch(Re):
             yield from b.gen_possible(min_len, max_len, state)
 
     @classmethod
-    def from_op_arg(cls, op: int, arg: Any, groups: Dict[int, ReSeq]) -> 'ReBranch':
+    def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, ReSeq]) -> 'ReBranch':
         assert op == sre_constants.BRANCH
         x, bs = arg
         assert x is None
@@ -837,11 +898,21 @@ class CompoundConstraint(Constraint):
         return self
 
 
-class Solution:
-    cells: Dict[cell_ix_type, Constraint]
+@dataclass(frozen=True, repr=False)
+class Solution(Mapping[cell_ix_type, Constraint]):
+    cells: FrozenDict[cell_ix_type, Constraint]
 
-    def __init__(self, cells: Dict[cell_ix_type, Constraint]):
-        self.cells = cells
+    def __init__(self, cells: Mapping[cell_ix_type, Constraint]):
+        object.__setattr__(self, 'cells', FrozenDict(cells))
+
+    def __getitem__(self, k: cell_ix_type) -> Constraint:
+        return self.cells[k]
+
+    def __len__(self) -> int:
+        return len(self.cells)
+
+    def __iter__(self) -> Iterator[cell_ix_type]:
+        return iter(self.cells)
 
     @classmethod
     def for_chr_seq(cls, string: String, chr_seq: ChrSeq) -> 'Solution':
@@ -869,7 +940,7 @@ class Solution:
             yield cls.for_chr_seq(string, match.chr_seq)
 
     def __repr__(self) -> str:
-        return f'<{self.__class__.__name__} cells={len(self.cells)}>'
+        return f'<{self.__class__.__name__} n={len(self.cells)}>'
 
     def intersection(self, other: 'Solution') -> Optional['Solution']:
         ixs_both, ixs_o, ixs_s = self.compute_intersection_sets(other)
@@ -903,10 +974,6 @@ class Solution:
         add_unique(ixs_s, self.cells)
         add_unique(ixs_o, other.cells)
 
-        return self.apply_refs(cells)
-
-    @classmethod
-    def apply_refs(cls, cells) -> Optional['Solution']:
         @lru_cache(100)
         def resolve_compound(cell_ix: cell_ix_type) -> Optional[CompoundConstraint]:
             cc = cells[cell_ix]
@@ -929,459 +996,7 @@ class Solution:
                 if r is None:
                     return None
                 cells[k] = r
-        return cls(cells)
-
-
-@dataclass(frozen=True)
-class OptionallySizedIterable(Iterable[T]):
-    iterable: Iterable[T]
-    max_size: Optional[int]
-    known_size: Optional[int]
-
-    @classmethod
-    def of_known_size(cls, iterable: Iterable[T], n: int) -> 'OptionallySizedIterable[T]':
-        return cls(iterable, n, n)
-
-    @classmethod
-    def of_bound_size(cls, iterable: Iterable[T], max_size: int) -> 'OptionallySizedIterable[T]':
-        return cls(iterable, max_size, None)
-
-    @classmethod
-    def of_unbound(cls, iterable: Iterable[T]) -> 'OptionallySizedIterable[T]':
-        return cls(iterable, None, None)
-
-    @classmethod
-    def of(cls, iterable: Union['OptionallySizedIterable[T]', Iterable[T]]) -> 'OptionallySizedIterable[T]':
-        if isinstance(iterable, OptionallySizedIterable):
-            return iterable
-        if isinstance(iterable, Collection):
-            return cls.of_known_size(iterable, len(iterable))
-        assert isinstance(iterable, Iterable)
-        return cls.of_unbound(iterable)
-
-    @classmethod
-    def of_cartesian_product(cls, iterable: Iterable[T], x: 'OptionallySizedIterable', y: 'OptionallySizedIterable'
-                             ) -> 'OptionallySizedIterable[T]':
-        if x.has_known_size and y.has_known_size:
-            return cls.of_known_size(iterable, x.known_size * y.known_size)
-        if x.is_bound and y.is_bound:
-            return cls.of_bound_size(iterable, x.max_size * y.max_size)
-        return cls.of_unbound(iterable)
-
-    def __iter__(self) -> Iterator[T]:
-        return iter(self.iterable)
-
-    @property
-    def is_bound(self) -> bool:
-        return self.max_size is not None
-
-    @property
-    def is_unbound(self) -> bool:
-        return self.max_size is None
-
-    @property
-    def has_known_size(self) -> bool:
-        return self.known_size is not None
-
-    @property
-    def len_str(self) -> str:
-        if self.is_unbound:
-            return 'unbound'
-        if self.has_known_size:
-            return f'={self._len_str(self.known_size)}'
-        return f'<={self._len_str(self.max_size)}'
-
-    @staticmethod
-    def _len_str(n: int) -> str:
-        return f'{n:,}' if n < 1e9 else f'{n:.1e}'
-
-    def __str__(self):
-        return f'seq {self.len_str}'
-
-    def __repr__(self) -> str:
-        return f'<{self.__class__.__name__} {self.len_str}>'
-
-    def as_sequence(self) -> Sequence[T]:
-        assert self.is_bound
-        return self.iterable if isinstance(self.iterable, Sequence) else tuple(self.iterable)
-
-    def map(self, func: Callable[[T], U]) -> 'OptionallySizedIterable[U]':
-        return OptionallySizedIterable(map(func, self.iterable), self.max_size, self.known_size)
-
-    def filter(self, func: Callable[[T], bool]) -> 'OptionallySizedIterable[T]':
-        return OptionallySizedIterable(filter(func, self.iterable), self.max_size, None)
-
-
-class SolutionSet(Collection[Solution]):
-    names: FrozenSet[str]
-    cell_indices: FrozenSet[cell_ix_type]
-    solutions: OptionallySizedIterable[Solution]
-
-    def __init__(self,
-                 names: FrozenSet[str],
-                 cell_indices: FrozenSet[cell_ix_type],
-                 solutions: Union[Iterable[Solution], OptionallySizedIterable[Solution]]):
-        self.names = names
-        self.cell_indices = cell_indices
-        self.solutions = OptionallySizedIterable.of(solutions)
-
-    @property
-    def names_str(self) -> str:
-        return ', '.join(sorted(self.names))
-
-    def contains(self, other: 'SolutionSet') -> bool:
-        return self.names >= other.names
-
-    def __str__(self) -> str:
-        return f'{self.names_str} cells={len(self.cell_indices)} (sols {self.solutions.len_str})'
-
-    def __repr__(self) -> str:
-        return f'<{self.__class__.__name__} {str(self)}>'
-
-    def __len__(self) -> int:
-        assert self.solutions.has_known_size
-        return self.solutions.known_size
-
-    def __iter__(self) -> Iterator[Solution]:
-        return iter(self.solutions)
-
-    def __contains__(self, x: object) -> bool:
-        raise NotImplementedError()
-
-    def intersection(self, other: 'SolutionSet') -> 'SolutionSet':
-        if self.contains(other):
-            return self
-        if other.contains(self):
-            return other
-
-        assert self.solutions.is_bound
-        assert other.solutions.is_bound
-
-        solutions = []
-        for a in self:
-            for b in other:
-                ab = a.intersection(b)
-                if ab is not None:
-                    solutions.append(ab)
-
-        return self.build_intersection(other, solutions)
-
-    def build_intersection(self, other: 'SolutionSet',
-                           solutions: Union[Iterable[Solution], OptionallySizedIterable[Solution]]):
-        return SolutionSet(self.names | other.names, self.cell_indices | other.cell_indices, solutions)
-
-    def cell_intersection(self, other: 'SolutionSet') -> FrozenSet[cell_ix_type]:
-        return self.cell_indices & other.cell_indices
-
-    def cell_intersection_frac(self, other: 'SolutionSet') -> float:
-        return len(self.cell_intersection(other)) / max(len(self), len(other))
-
-    def estimate_intersection_size(self, other: 'SolutionSet', random: Random, sample_size=50,
-                                   rate_floor_clamp=0.005) -> float:
-        if not self.cell_intersection(other):
-            return len(self) * len(other)
-
-        def sample(ss: SolutionSet) -> Collection[Solution]:
-            if len(ss) < sample_size:
-                return ss
-            shuffled = list(ss.solutions)
-            random.shuffle(shuffled)
-            return shuffled[:sample_size:]
-
-        sample_a = sample(self)
-        sample_b = sample(other)
-        intersection_count = sum(1 for a in sample_a for b in sample_b if a.can_intersect(b))
-        intersection_rate = intersection_count / (len(sample_b) * len(sample_b))
-        intersection_rate = max(intersection_rate, rate_floor_clamp)
-        return intersection_rate * (len(self) * len(other))
-
-    @classmethod
-    def for_string(cls, s: String, random: Random):
-        solutions = list(Solution.generate_solutions(s))
-        random.shuffle(solutions)
-        return cls(frozenset([s.name]), frozenset(p.cell.index for p in s.positions), solutions)
-
-
-def select_smallest_solution_set(solution_sets: Iterable[SolutionSet]) -> SolutionSet:
-    smallest: Optional[SolutionSet] = None
-    for solution_set in solution_sets:
-        if len(solution_set) <= 1:
-            return solution_set
-        if smallest is None or len(solution_set) < len(smallest):
-            smallest = solution_set
-    return smallest
-
-
-def drop_redundant_solution_sets(solution_sets: Iterable[SolutionSet]) -> Collection[SolutionSet]:
-    unique_solution_sets: Iterable[SolutionSet] = {s.names: s for s in solution_sets}.values()
-    return [s for s in unique_solution_sets
-            if not any(o.contains(s) for o in unique_solution_sets if o is not s)]
-
-
-class SolutionSetIntersectionCache:
-    cache: Dict[FrozenSet[str], SolutionSet]
-
-    def __init__(self, existing: Iterable[SolutionSet] = ()):
-        self.cache = {s.names: s for s in existing}
-
-    def intersection(self, a: SolutionSet, b: SolutionSet) -> SolutionSet:
-        key = a.names | b.names
-        result = self.cache.get(key)
-        if result is None:
-            result = self.cache[key] = a.intersection(b)
-        return result
-
-
-def merge_cross_axes_solution_sets(axes_solution_sets: Dict[str, Collection[SolutionSet]]):
-    axes = frozenset(axes_solution_sets)
-    intersection = SolutionSetIntersectionCache().intersection
-    intersections = []
-    with tqdm(total=sum(map(len, axes_solution_sets.values()))) as progress:
-        for axis, axis_solutions in axes_solution_sets.items():
-            other_axes_solutions = [other_solution for other_axis in axes - {axis}
-                                    for other_solution in axes_solution_sets[other_axis]]
-            for axis_solution in axis_solutions:
-                progress.set_description(f'merge cross axis {axis_solution}')
-                progress.update()
-                intersections.append(select_smallest_solution_set(intersection(axis_solution, p)
-                                                                  for p in other_axes_solutions))
-    return drop_redundant_solution_sets(intersections)
-
-
-def reduce_solution_sets_using_best_pair_intersections(solution_sets: Collection[SolutionSet]
-                                                       ) -> Collection[SolutionSet]:
-    solution_sets = sorted(solution_sets, key=len)
-    intersection = SolutionSetIntersectionCache(solution_sets).intersection
-    intersections = []
-    with tqdm(solution_sets, desc='reduce_best_pair_intersect') as progress:
-        for solution_set in progress:
-            solution_set: SolutionSet = solution_set
-
-            def gen_intersections() -> Iterable[SolutionSet]:
-                for other in solution_sets:
-                    if other is not solution_set:
-                        progress.set_description(f'reduce {solution_set} & {other}')
-                        yield intersection(solution_set, other)
-
-            intersections.append(select_smallest_solution_set(gen_intersections()))
-    return drop_redundant_solution_sets(intersections)
-
-
-def reduce_solution_sets_by_smallest_pair(solution_sets: Collection[SolutionSet]) -> Collection[SolutionSet]:
-    if len(solution_sets) <= 1:
-        return solution_sets
-    solution_sets = sorted(solution_sets, key=len, reverse=True)
-    a = solution_sets.pop(-1)
-    b = solution_sets.pop(-1)
-    solution_sets.append(a.intersection(b))
-    return solution_sets
-
-
-def reduce_solution_sets_by_highest_overlap(solution_sets: Collection[SolutionSet]) -> Collection[SolutionSet]:
-    if len(solution_sets) <= 1:
-        return solution_sets
-    solution_sets = list(solution_sets)
-    n = len(solution_sets)
-    indexes = ((i, j) for i in range(n) for j in range(i + 1, n))
-    i, j = max(indexes, key=lambda x: solution_sets[x[0]].cell_intersection_frac(solution_sets[x[1]]))
-    assert j > i  # pop the largest index first so smaller is still valid
-    a = solution_sets.pop(j)
-    b = solution_sets.pop(i)
-    solution_sets.append(a.intersection(b))
-    return solution_sets
-
-
-def reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[SolutionSet], random: Random
-                                                   ) -> Collection[SolutionSet]:
-    if len(solution_sets) <= 1:
-        return solution_sets
-    solution_sets = list(solution_sets)
-    n = len(solution_sets)
-
-    def gen_indexes():
-        with tqdm(total=n * (n - 1) // 2) as progress:
-            for i in range(n):
-                for j in range(i + 1, n):
-                    progress.set_description(f'estimating intersection ({i},{j})', refresh=False)
-                    progress.update()
-                    yield i, j
-
-    i, j = min(gen_indexes(), key=lambda x: solution_sets[x[0]].estimate_intersection_size(solution_sets[x[1]], random))
-    assert j > i  # pop the largest index first so smaller is still valid
-    a = solution_sets.pop(j)
-    b = solution_sets.pop(i)
-    solution_sets.append(a.intersection(b))
-    return solution_sets
-
-
-def multi_reduce_solution_sets_by_lowest_estimated_count(solution_sets: Collection[SolutionSet], random: Random,
-                                                         max_reduce_size: int = 2000
-                                                         ) -> Collection[SolutionSet]:
-    too_large: List[SolutionSet] = []
-
-    def filter_to_large(sss: Collection[SolutionSet]) -> List[SolutionSet]:
-        too_large.extend(ss for ss in sss if len(ss) > max_reduce_size)
-        return [ss for ss in sss if len(ss) <= max_reduce_size]
-
-    solution_sets = filter_to_large(solution_sets)
-    while len(solution_sets) > 1:
-        solution_sets = reduce_solution_sets_by_lowest_estimated_count(solution_sets, random)
-        solution_sets = filter_to_large(solution_sets)
-
-    return solution_sets + too_large
-
-
-def iter_sequence_pair_indices(n: int) -> OptionallySizedIterable[Tuple[int, int]]:
-    def gen(n=n) -> Iterable[Tuple[int, int]]:
-        for i in range(n):
-            for j in range(i + 1, n):
-                yield i, j
-
-    return OptionallySizedIterable.of_known_size(gen(), n * (n - 1) // 2)
-
-
-def iter_sequence_pairs(xs: Sequence[T]) -> OptionallySizedIterable[Tuple[T, T]]:
-    return iter_sequence_pair_indices(len(xs)).map(lambda p: (xs[p[0]], xs[p[1]]))
-
-
-def iter_pairs_randomly_with_replacement(xs: Sequence[T], ys: Sequence[U],
-                                         random_state: Optional[Union[int, Random]] = None
-                                         ) -> OptionallySizedIterable[Tuple[T, U]]:
-    random: Random = random_state if isinstance(random_state, Random) else Random(random_state)
-
-    def gen(xs=xs, ys=ys) -> Iterable[Tuple[T, U]]:
-        nx = len(xs)
-        ny = len(ys)
-        randint = random.randint
-        while True:
-            yield xs[randint(0, nx)], ys[randint(0, ny)]
-
-    return OptionallySizedIterable.of_unbound(gen())
-
-
-def iter_pairs_randomly_wo_replacement(xs: Sequence[T], ys: Sequence[U],
-                                       random_state: Optional[Union[int, Random]] = None
-                                       ) -> OptionallySizedIterable[Tuple[T, U]]:
-    if isinstance(random_state, Random):
-        random_state = random_state.randrange(0, 0xFFFFFFFF)
-    random = np_random.RandomState(random_state)
-    nx = len(xs)
-    n = nx * len(ys)
-    indices = np.arange(0, n, dtype=np.int32)
-    random.shuffle(indices)
-
-    def gen(xs=xs, ys=ys) -> Iterable[Tuple[T, U]]:
-        for inx in indices:
-            j, i = divmod(inx, nx)
-            yield xs[i], ys[j]
-
-    return OptionallySizedIterable.of_known_size(gen(), n)
-
-
-def iter_pairs_randomly(xs: Sequence[T], ys: Sequence[U],
-                        random_state: Optional[Union[int, Random]] = None) -> OptionallySizedIterable[Tuple[T, U]]:
-    n = len(xs) * len(ys)
-    if n > 10_000_000:
-        return OptionallySizedIterable.of_unbound(
-            iter_pairs_randomly_with_replacement(xs, ys, random_state))
-    else:
-        return iter_pairs_randomly_wo_replacement(xs, ys, random_state)
-
-
-def stochastically_merge_solution_set_pair_bound(
-        x: SolutionSet, y: SolutionSet, random: Random,
-        callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
-    pairs = iter_pairs_randomly_wo_replacement(x.solutions.as_sequence(), y.solutions.as_sequence(),
-                                               random_state=random)
-    assert pairs.is_bound, f'unbound pairs for {x} and {y}'
-
-    nx = str(x)
-    ny = str(y)
-
-    def mapper(pair: Tuple[Solution, Solution]) -> Optional[Solution]:
-        xi, yi = pair
-        xy = xi.intersection(yi)
-        callback(nx, ny, xy)
-        return xy
-
-    lazy_intersections = pairs.map(mapper).filter(lambda s: s is not None)
-    return x.build_intersection(y, lazy_intersections)
-
-
-class RepeatableLazy(Iterable[T]):
-    source: Iterator[T]
-    realized: List[T]
-    is_realized: bool = False
-
-    def __init__(self, source: Iterator[T]):
-        self.source = source
-        self.realized = []
-
-    def __iter__(self) -> Iterator[T]:
-        if self.is_realized:
-            return iter(self.realized)
-        return iter(self.realize())
-
-    def realize(self) -> Iterable[T]:
-        sentinel = object()
-        while True:
-            n = next(self.source, sentinel)
-            if n is sentinel:
-                self.is_realized = True
-                break
-            yield n
-            self.realized.append(n)
-
-
-def merge_solution_set_pair_unbound(x: SolutionSet, y: SolutionSet,
-                                    callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
-    xs = x.solutions
-    ys = y.solutions
-    if xs.is_bound and (not ys.is_bound or xs.max_size < ys.max_size):
-        x, y = y, x
-        xs, ys = ys, xs
-    assert ys.is_bound, f'inner iterable is unbound for {y}'
-
-    def gen() -> Iterable[Solution]:
-        repeatable_ys = RepeatableLazy(iter(ys))
-        nx = str(x)
-        ny = str(y)
-        for xi in xs:
-            for yi in repeatable_ys:
-                xy = xi.intersection(yi)
-                callback(nx, ny, xy)
-                if xy is not None:
-                    yield xy
-
-    lazy_intersections = (OptionallySizedIterable.of_bound_size(gen(), xs.max_size * ys.max_size)
-                          if xs.is_bound and ys.is_bound else
-                          OptionallySizedIterable.of_unbound(gen()))
-    return x.build_intersection(y, lazy_intersections)
-
-
-def stochastically_merge_solution_set_pair(
-        x: SolutionSet, y: SolutionSet, random: Random,
-        max_known_size: int, max_bound_size: int,
-        callback: Callable[[str, str, Optional[Solution]], Any]) -> SolutionSet:
-    if x.contains(y):
-        return x
-    if y.contains(x):
-        return y
-    xs = x.solutions
-    ys = y.solutions
-    if ((xs.has_known_size and ys.has_known_size and xs.known_size * ys.known_size < max_known_size) or
-            (xs.is_bound and ys.is_bound and xs.max_size * ys.max_size < max_bound_size)):
-        return stochastically_merge_solution_set_pair_bound(x, y, random, callback)
-    return merge_solution_set_pair_unbound(x, y, callback)
-
-
-def stochastically_merge_solution_sets(solution_sets: Collection[SolutionSet], random: Random,
-                                       callback: Callable[[str, str, Optional[Solution]], Any],
-                                       max_known_size: int = 1_000_000,
-                                       max_bound_size: int = 200_000) -> SolutionSet:
-    return reduce(lambda x, y: stochastically_merge_solution_set_pair(x, y, random,
-                                                                      max_known_size, max_bound_size, callback),
-                  sorted(solution_sets, key=len))
+        return Solution(cells)
 
 
 @dataclass(frozen=True, order=True)
@@ -1404,7 +1019,15 @@ class DimensionSolutions(ABC):
         pass
 
     @abstractmethod
-    def points(self, dimension: Dimension) -> Iterable[int]:
+    def get_indexes(self, dimension: Dimension) -> Iterable[int]:
+        pass
+
+    @abstractmethod
+    def is_point(self, dimension: Dimension) -> bool:
+        pass
+
+    @abstractmethod
+    def select(self, dimension: Dimension, values: Mapping[int, T]) -> Iterable[T]:
         pass
 
     @abstractmethod
@@ -1432,7 +1055,7 @@ class DimensionSolutions(ABC):
 class DimensionSolutionAll(DimensionSolutions):
     _instance: Optional['DimensionSolutionAll'] = None
 
-    def __new__(cls) -> Any:
+    def __new__(cls) -> 'DimensionSolutionAll':
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -1452,8 +1075,14 @@ class DimensionSolutionAll(DimensionSolutions):
     def size(self, dimension: Dimension) -> int:
         return dimension.size
 
-    def points(self, dimension: Dimension) -> Iterable[int]:
+    def get_indexes(self, dimension: Dimension) -> Iterable[int]:
         return range(dimension.size)
+
+    def is_point(self, dimension: Dimension) -> bool:
+        return dimension.size == 1
+
+    def select(self, dimension: Dimension, values: Mapping[int, T]) -> Iterable[T]:
+        return values.values()
 
     def optimize(self, dimension: Dimension) -> DimensionSolutions:
         return self
@@ -1462,19 +1091,16 @@ class DimensionSolutionAll(DimensionSolutions):
 dimension_all: DimensionSolutions = DimensionSolutionAll()
 
 
+@dataclass(frozen=True)
 class DimensionSolutionIndexes(DimensionSolutions):
     indexes: FrozenSet[int]
-    negate: bool
-
-    def __init__(self, solutions: FrozenSet[int], negate: bool = False):
-        self.indexes = solutions
-        self.negate = negate
-
-    def __str__(self):
-        return f'{"-" if self.negate else "+"}{len(self.indexes)}'
+    negate: bool = False
 
     def __repr__(self):
         return f'<{self.__class__.__name__} sz={self}>'
+
+    def __str__(self):
+        return f'{"-" if self.negate else "+"}{len(self.indexes)}'
 
     def intersection(self, other: DimensionSolutions) -> DimensionSolutions:
         if other is dimension_all:
@@ -1505,10 +1131,18 @@ class DimensionSolutionIndexes(DimensionSolutions):
     def size(self, dimension: Dimension) -> int:
         return dimension.size - len(self.indexes) if self.negate else len(self.indexes)
 
-    def points(self, dimension: Dimension) -> Iterable[int]:
+    def get_indexes(self, dimension: Dimension) -> Iterable[int]:
         if self.negate:
             return frozenset(range(dimension.size)) - self.indexes
         return self.indexes
+
+    def is_point(self, dimension: Dimension) -> bool:
+        if self.negate:
+            return len(self.indexes) == dimension.size - 1
+        return len(self.indexes) == 1
+
+    def select(self, dimension: Dimension, values: Mapping[int, T]) -> Iterable[T]:
+        return (values[i] for i in self.get_indexes(dimension))
 
     def optimize(self, dim: Dimension) -> DimensionSolutions:
         if len(self.indexes) == dim.size:
@@ -1518,11 +1152,12 @@ class DimensionSolutionIndexes(DimensionSolutions):
         return self
 
 
+@dataclass(frozen=True)
 class DimensionCombination(Collection[Tuple[Dimension, DimensionSolutions]]):
-    dimensions: Mapping[Dimension, DimensionSolutions]
+    dimensions: FrozenDict[Dimension, DimensionSolutions]
 
     def __init__(self, dimensions: Mapping[Dimension, DimensionSolutions]):
-        self.dimensions = dimensions
+        object.__setattr__(self, 'dimensions', FrozenDict(dimensions))
 
     def __len__(self) -> int:
         return len(self.dimensions)
@@ -1532,6 +1167,35 @@ class DimensionCombination(Collection[Tuple[Dimension, DimensionSolutions]]):
 
     def __contains__(self, x: object) -> bool:
         return x in self.dimensions.items()
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self}>'
+
+    def __str__(self):
+        sz = self.size()
+        if sz > 1e9:
+            sz_str = f'{sz:.1e}'
+        else:
+            sz_str = f'{sz:,}'
+
+        point_dimensions = self.point_dimensions()
+        index_dimensions = {dim: sol for dim, sol in self.index_dimensions().items()
+                            if dim not in point_dimensions}
+
+        def dim_str(dims: Collection[T], detail_func: Callable[[Collection[T]], str]) -> str:
+            if not dims:
+                return '[]'
+            if len(dims) > 5:
+                return f'[{len(dims)} dims]'
+            return detail_func(dims)
+
+        all_str = dim_str(self.all_dimensions(), lambda x: '[{}]'.format(', '.join(f'{dim}' for dim in x)))
+        pts_str = dim_str(point_dimensions, lambda x: '[{}]'.format(
+            ', '.join(f'{dim}: {list(sol.get_indexes(dim))[0]}' for dim, sol in x.items())))
+        ixs_str = dim_str(index_dimensions, lambda x: '[{}]'.format(
+            ', '.join(f'{dim}: {sol.size(dim)}' for dim, sol in x.items())))
+
+        return f'sz={sz_str} all={all_str} pts={pts_str} ixs={ixs_str}'
 
     def size(self) -> int:
         if not self.dimensions:
@@ -1543,6 +1207,24 @@ class DimensionCombination(Collection[Tuple[Dimension, DimensionSolutions]]):
                 return 0
             sz *= c_sz
         return sz
+
+    def all_dimensions(self) -> Set[Dimension]:
+        return {dim for dim, sol in self.dimensions.items()
+                if isinstance(sol, DimensionSolutionAll)}
+
+    def index_dimensions(self) -> Mapping[Dimension, DimensionSolutionIndexes]:
+        return {dim: sol for dim, sol in self.dimensions.items()
+                if isinstance(sol, DimensionSolutionIndexes)}
+
+    def point_dimensions(self) -> Mapping[Dimension, DimensionSolutions]:
+        return {dim: sol for dim, sol in self.dimensions.items() if sol.is_point(dim)}
+
+    @property
+    def is_point(self) -> bool:
+        return bool(self.dimensions) and all(sol.is_point(dim) for dim, sol in self.dimensions.items())
+
+    def select(self, values: Mapping[Dimension, Mapping[int, T]]) -> Mapping[Dimension, Iterable[T]]:
+        return {dim: sol.select(dim, values[dim]) for dim, sol in self.dimensions.items()}
 
     def intersection(self, other: 'DimensionCombination') -> 'DimensionCombination':
         return self._merge(other, lambda a, b: a.intersection(b))
@@ -1590,7 +1272,7 @@ class DimensionCombination(Collection[Tuple[Dimension, DimensionSolutions]]):
             def gen() -> Iterable[Mapping[Dimension, DimensionSolutions]]:
                 dim, sols = n
                 for p in previous:
-                    for i in sols.points(dim):
+                    for i in sols.get_indexes(dim):
                         c = dict(p)
                         c[dim] = DimensionSolutionIndexes(frozenset([i]), negate=False)
                         yield c
@@ -1633,11 +1315,9 @@ class ConstraintDimensionCombination(Collection[Tuple[Constraint, DimensionCombi
         return any(c.size() for c in self.constraint_dimensions.values())
 
 
+@dataclass(frozen=True)
 class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
     constraint_dimensions: Sequence[Tuple[Constraint, DimensionCombination]]
-
-    def __init__(self, constraints: Sequence[Tuple[Constraint, DimensionCombination]]):
-        self.constraint_dimensions = constraints
 
     def __len__(self) -> int:
         return len(self.constraint_dimensions)
@@ -1647,6 +1327,19 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
 
     def __contains__(self, x: object) -> bool:
         return x in self.constraint_dimensions
+
+    def __repr__(self):
+        return f'<{self.__class__.__name__} {self}>'
+
+    def __str__(self):
+        cds = self.constraint_dimensions
+        if not cds:
+            return '[]'
+        if len(cds) > 10:
+            return f'[n={len(cds)} cds]'
+        if len(cds) > 5:
+            return ', '.join(str(con) for con, comb in cds)
+        return '[{}]'.format(', '.join(f'{con}: {comb}' for con, comb in cds))
 
     def constraints(self) -> Collection[Constraint]:
         return [con for con, comb in self.constraint_dimensions]
@@ -1759,7 +1452,7 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
         return point_constraint
 
     @classmethod
-    def for_dimension(cls, dim: Dimension, constraints: Dict[Constraint, List[int]]):
+    def for_dimension(cls, dim: Dimension, constraints: Mapping[Constraint, List[int]]):
         return cls(tuple((con, DimensionCombination.for_dimension(dim, indices))
                          for con, indices in constraints.items()))
 
@@ -1850,33 +1543,8 @@ class SparseSolutionSet:
                 cells[ref] = cells[ref].intersection_constraint(constraint.lit_component)
         return SparseSolutionSet(self.dimensions, cells)
 
-    def eliminate_impossible_references(self) -> 'SparseSolutionSet':
-        cells = dict(self.cells)
-        for ix, cell in self.cells.items():
-            if not cell.has_references:
-                continue
-
-    def iter_solutions(self) -> Iterable[Solution]:
-
-        def build_solution(point: DimensionCombination) -> Optional[Solution]:
-            cells: Dict[cell_ix_type, Constraint] = {}
-            for ix, cell in self.cells.items():
-                cell = cell.point_constraint(point)
-                if cell is None:
-                    return None
-                cells[ix] = cell
-            return Solution.apply_refs(cells)
-
-        ci = self.common_intersection()
-        with tqdm(self.common_intersection().iter_points(),
-                  total=ci.size(), desc='iter_solutions') as progress:
-            for p in progress:
-                solution = build_solution(p)
-                if solution is not None:
-                    yield solution
-
     @classmethod
-    def for_string(cls, s: String) -> 'SparseSolutionSet':
+    def for_string(cls, s: String) -> Tuple['SparseSolutionSet', Sequence[Solution]]:
         solutions = list(Solution.generate_solutions(s))
         cells: Dict[cell_ix_type, Dict[Constraint, List[int]]] = defaultdict(lambda: defaultdict(list))
         for sol_i, solution in enumerate(solutions):
@@ -1884,8 +1552,8 @@ class SparseSolutionSet:
                 cells[ix][con].append(sol_i)
 
         dim = Dimension(s.name[0], int(s.name[1::]), len(solutions))
-        return cls(frozenset([dim]), {ix: CellConstraints.for_dimension(dim, cons)
-                                      for ix, cons in cells.items()})
+        ss = cls(frozenset([dim]), {ix: CellConstraints.for_dimension(dim, cons) for ix, cons in cells.items()})
+        return ss, solutions
 
 
 class PuzzleDrawer:
@@ -1997,76 +1665,96 @@ def draw_puzzle(ax: Optional[plt.Axes] = None, fig_size=11, fontsize=13, font='D
     return drawer
 
 
-def old_main():
-    print('building strings')
-    strings = build_strings()
+@dataclass(frozen=True)
+class Solver:
+    dims_to_strings: FrozenDict[Dimension, String]
+    indexed_solutions: FrozenDict[Dimension, Mapping[int, Solution]]
 
-    random = Random(0xCAFE)
-    random.shuffle(strings)
-    # strings = strings[:16]
+    @classmethod
+    def create_for_strings(cls, strings: Iterable[String]) -> Tuple['Solver', Sequence[SparseSolutionSet]]:
+        dims_to_strings = {}
+        solution_sets = []
+        indexed_solutions = {}
+        with tqdm(strings, desc='init solutions') as progress:
+            for string in progress:
+                ss, solutions = SparseSolutionSet.for_string(string)
+                dim, = ss.dimensions
+                # skip dimensions that only have a single solution
+                if dim.size == 1:
+                    continue
+                dims_to_strings[dim] = string
+                solution_sets.append(ss)
+                indexed_solutions[dim] = {i: sol for i, sol in enumerate(solutions)}
+        solver = cls(dims_to_strings=FrozenDict(dims_to_strings), indexed_solutions=FrozenDict(indexed_solutions))
+        return solver, tuple(solution_sets)
 
-    with tqdm(strings, desc='init solutions') as progress:
-        solution_sets = [SolutionSet.for_string(s, random) for s in progress]
+    @staticmethod
+    def intersect(xs: Iterable[T]) -> Optional[T]:
+        return reduce(lambda a, b: None if a is None or b is None else a.intersection(b), xs)
 
-    solution_sets = multi_reduce_solution_sets_by_lowest_estimated_count(solution_sets, random)
-    print(f'post estimation {len(solution_sets)} solutions')
+    @staticmethod
+    def iteratively_simplify(solution_set: SparseSolutionSet, max_iterations=20) -> SparseSolutionSet:
+        ci = solution_set.common_intersection()
+        with tqdm(range(max_iterations), desc='process') as progress:
+            for i in progress:
+                start_ci = ci
+                progress.set_description(f'process {i} {start_ci}')
+                solution_set = solution_set.filter_cells_using_other_unions()
+                solution_set = solution_set.apply_references()
+                solution_set = solution_set.push_reference_constraints()
+                ci = solution_set.common_intersection()
+                if start_ci == ci:
+                    break
+        return solution_set
 
-    i = 0
-    with tqdm() as progress:
-        def callback(xi, yi, xy):
-            nonlocal i
-            i += 1
-            if i % 10 == 0:
-                progress.set_description(('no', '  ')[xy is not None] + f'match {xi} & {yi}', refresh=False)
-                progress.update()
+    def point_solution(self, point: DimensionCombination) -> Optional[Solution]:
+        assert point.is_point
+        return self.intersect([sol for sol, in point.select(self.indexed_solutions).values()])
 
-        solutions = stochastically_merge_solution_sets(solution_sets, random=random, callback=callback)
-        print(solutions)
-        solution = next(iter(solutions))
+    def expand_solution_set(self, solution_set: SparseSolutionSet) -> FrozenSet[Solution]:
+        ci = solution_set.common_intersection()
+        point_dim = DimensionCombination(ci.point_dimensions())
+        print('pt', point_dim)
+        point_solution = self.point_solution(point_dim)
+        print('pt sol', point_solution)
+        if point_solution is None:
+            return frozenset()
 
-    print(solution)
+        ix_dims = DimensionCombination({dim: sol for dim, sol in ci if not sol.is_point(dim)})
+        print('ix dims', ix_dims)
+        if len(ix_dims) == 0:
+            return frozenset([point_solution])
 
+        final_solution = set()
+        with tqdm(ix_dims.iter_points(), total=ix_dims.size()) as progress:
+            for p in progress:
+                progress.set_description(f'expand {p}')
+                ix_solution = self.point_solution(p)
+                if ix_solution is not None:
+                    ix_solution = ix_solution.intersection(point_solution)
+                    if ix_solution is not None:
+                        final_solution.add(ix_solution)
 
-def main():
-    from pprint import pprint
+        return frozenset(final_solution)
 
-    print('building strings')
-    strings = build_strings()
+    @classmethod
+    def solve(cls) -> FrozenSet[Solution]:
+        strings = build_strings()
+        solver, solution_sets = cls.create_for_strings(strings)
+        solution_set = solver.intersect(solution_sets)
+        if solution_set is None:
+            return frozenset()
 
-    def show(sol: SparseSolutionSet):
-        pprint({ix: [[con, comb.dimensions]
-                     for con, comb in cc.constraint_dimensions]
-                for ix, cc in sol.cells.items()})
+        ci = solution_set.common_intersection()
+        print('init ci', ci)
 
-    # a = SparseSolutionSet.for_string(strings[0])
-    # b = SparseSolutionSet.for_string(strings[13])
-    #
-    # show(a)
-    # show(b)
-    # i = a.intersection(b)
-    # show(i)
+        solution_set = solver.iteratively_simplify(solution_set)
+        ci = solution_set.common_intersection()
+        print('iter ci', ci)
 
-    random = Random(0xCAFE)
-    random.shuffle(strings)
-    # strings = strings[:20]
-
-    with tqdm(strings, desc='init solutions') as progress:
-        solution_sets = [SparseSolutionSet.for_string(s) for s in progress]
-
-    s = reduce(lambda a, b: a.intersection(b), solution_sets)
-    # show(s)
-
-    with tqdm(range(10), desc='process') as progress:
-        for _ in progress:
-            s = s.filter_cells_using_other_unions()
-            s = s.apply_references()
-            s = s.push_reference_constraints()
-
-    c = s.common_intersection()
-    print(c.size())
-
-    solutions = list(s.iter_solutions())
-    print(len(solutions))
+        final_solutions = solver.expand_solution_set(solution_set)
+        print('final_solutions', final_solutions)
+        return final_solutions
 
 
-__name__ == '__main__' and main()
+__name__ == '__main__' and Solver.solve()
