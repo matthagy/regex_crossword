@@ -692,6 +692,25 @@ class LiteralConstraint(Constraint):
             return None
         return LiteralConstraint(combined, negate=False)
 
+    def union(self, other: 'LiteralConstraint') -> 'LiteralConstraint':
+        if self.negate == other.negate:
+            if self.negate:
+                combined = self.chars & other.chars
+                if not combined:
+                    return all_literal_constraint
+                return LiteralConstraint(combined, negate=True)
+            return LiteralConstraint(self.chars | other.chars, negate=False)
+
+        pos, neg = self, other
+        if pos.negate:
+            pos, neg = neg, pos
+        assert not pos.negate
+        assert neg.negate
+        combined = neg.chars - pos.chars
+        if not combined:
+            return all_literal_constraint
+        return LiteralConstraint(combined, negate=True)
+
     def label(self) -> str:
         if self.negate and not self.chars:
             return '[.]'
@@ -884,6 +903,10 @@ class Solution:
         add_unique(ixs_s, self.cells)
         add_unique(ixs_o, other.cells)
 
+        return self.apply_refs(cells)
+
+    @classmethod
+    def apply_refs(cls, cells) -> Optional['Solution']:
         @lru_cache(100)
         def resolve_compound(cell_ix: cell_ix_type) -> Optional[CompoundConstraint]:
             cc = cells[cell_ix]
@@ -906,7 +929,7 @@ class Solution:
                 if r is None:
                     return None
                 cells[k] = r
-        return Solution(cells)
+        return cls(cells)
 
 
 @dataclass(frozen=True)
@@ -1680,7 +1703,8 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
 
     @staticmethod
     def resolve_references(cells: Mapping[cell_ix_type, 'CellConstraints'],
-                           comb: DimensionCombination, ref_con: RefConstraint,
+                           comb: DimensionCombination,
+                           ref_con: RefConstraint,
                            lit_con: Optional[LiteralConstraint]) -> ConstraintDimensionCombination:
         int_combs = ConstraintDimensionCombination()
         for ix in ref_con.indices:
@@ -1691,7 +1715,7 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
                         continue
                 ref_int = ref_con.intersection(refed_con)
                 assert ref_int is not None
-                int_combs.add(ref_int, refed_comb.intersection(comb))
+                int_combs.add(ref_int, comb)
         return int_combs
 
     def optimize(self) -> 'CellConstraints':
@@ -1709,13 +1733,14 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
         assert constraint_dimensions, f'no matching dimension combinations'
         return CellConstraints(constraint_dimensions)
 
-    def intersection_constraint(self, con: Constraint) -> 'CellConstraints':
+    def intersection_constraint(self, con: Constraint) -> Optional['CellConstraints']:
         constraint_dimensions = []
         for con_i, comb_i in self.constraint_dimensions:
             con_i = con_i.intersection(con)
             if con_i is not None:
                 constraint_dimensions.append((con_i, comb_i))
-        assert constraint_dimensions, f'no matching dimension combinations'
+        if not constraint_dimensions:
+            raise RuntimeError(f'no matching dimension combinations')
         return CellConstraints(constraint_dimensions)
 
     def point_constraint(self, point: DimensionCombination) -> Optional[Constraint]:
@@ -1775,6 +1800,11 @@ class SparseSolutionSet:
         for ix in other.cells.keys() - common:
             cells[ix] = other.cells[ix].add_dimensions_all(dims_s)
 
+        return SparseSolutionSet(self.dimensions | other.dimensions, cells)
+
+    def apply_references(self) -> Optional['SparseSolutionSet']:
+        cells = dict(self.cells)
+
         @lru_cache(len(cells))
         def apply_constraints(cell_ix: cell_ix_type) -> Optional[CellConstraints]:
             cc = cells[cell_ix]
@@ -1792,9 +1822,9 @@ class SparseSolutionSet:
                 ac = apply_constraints(ix)
                 if ac is None:
                     return None
-                cells[ix] = c
+                cells[ix] = ac
 
-        return SparseSolutionSet(self.dimensions | other.dimensions, cells)
+        return SparseSolutionSet(self.dimensions, cells)
 
     def filter_cells_using_other_unions(self) -> Optional['SparseSolutionSet']:
         common_intersection = self.common_intersection()
@@ -1820,6 +1850,12 @@ class SparseSolutionSet:
                 cells[ref] = cells[ref].intersection_constraint(constraint.lit_component)
         return SparseSolutionSet(self.dimensions, cells)
 
+    def eliminate_impossible_references(self) -> 'SparseSolutionSet':
+        cells = dict(self.cells)
+        for ix, cell in self.cells.items():
+            if not cell.has_references:
+                continue
+
     def iter_solutions(self) -> Iterable[Solution]:
 
         def build_solution(point: DimensionCombination) -> Optional[Solution]:
@@ -1829,7 +1865,7 @@ class SparseSolutionSet:
                 if cell is None:
                     return None
                 cells[ix] = cell
-            return Solution(cells)
+            return Solution.apply_refs(cells)
 
         ci = self.common_intersection()
         with tqdm(self.common_intersection().iter_points(),
@@ -2020,9 +2056,10 @@ def main():
     s = reduce(lambda a, b: a.intersection(b), solution_sets)
     # show(s)
 
-    with tqdm(range(10), desc='filter') as progress:
+    with tqdm(range(10), desc='process') as progress:
         for _ in progress:
             s = s.filter_cells_using_other_unions()
+            s = s.apply_references()
             s = s.push_reference_constraints()
 
     c = s.common_intersection()
