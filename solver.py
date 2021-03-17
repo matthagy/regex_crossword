@@ -99,22 +99,25 @@ class FrozenDict(Mapping[K, V]):
         return o in self._d
 
 
+class ReChr(ABC):
+    pass
+
 @dataclass(frozen=True)
-class ChrSeq(Sequence['ReChr']):
-    chrs: Tuple['ReChr', ...]
+class ChrSeq(Sequence[ReChr]):
+    chrs: Tuple[ReChr, ...]
 
     def add(self, other: 'ChrSeq') -> 'ChrSeq':
         return chr_seq(self.chrs + other.chrs)
 
     @overload
-    def __getitem__(self, i: int) -> 'ReChr':
+    def __getitem__(self, i: int) -> ReChr:
         pass
 
     @overload
     def __getitem__(self, s: slice) -> 'ChrSeq':
         pass
 
-    def __getitem__(self, i: Union[int, slice]) -> Union['ReChr', 'ChrSeq']:
+    def __getitem__(self, i: Union[int, slice]) -> Union[ReChr, 'ChrSeq']:
         if isinstance(i, slice):
             return ChrSeq(self.chrs[i])
         else:
@@ -237,8 +240,7 @@ class Re(ABC):
         return cls.op_converters[op](op, arg, groups)
 
 
-class ReChr(ABC):
-    pass
+
 
 
 class ReAny(Re, ReChr):
