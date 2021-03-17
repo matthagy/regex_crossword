@@ -166,7 +166,7 @@ class SolutionTest(unittest.TestCase):
         return solver.LiteralConstraint(frozenset(chrs), negate)
 
     @staticmethod
-    def ref_c(*ixs: solver.cell_ix_type):
+    def ref_c(*ixs: solver.ix2d):
         return solver.RefConstraint(frozenset(ixs))
 
     @staticmethod

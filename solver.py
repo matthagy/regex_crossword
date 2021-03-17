@@ -33,6 +33,8 @@ U = TypeVar('U')
 K = TypeVar('K')
 V = TypeVar('V')
 
+ix2d = Tuple[int, int]
+
 
 def or_else(x: Optional[T], e: T) -> T:
     return x if x is not None else e
@@ -99,8 +101,114 @@ class FrozenDict(Mapping[K, V]):
         return o in self._d
 
 
+class Lattice(ABC):
+    @property
+    @abstractmethod
+    def dims(self) -> int:
+        pass
+
+    @property
+    def projection_dims(self) -> int:
+        return self.dims
+
+    @property
+    @abstractmethod
+    def size(self) -> int:
+        pass
+
+
+class Lattice2D(Lattice, ABC):
+    @property
+    def projection_dims(self) -> int:
+        return 2
+
+    @property
+    @abstractmethod
+    def rows(self) -> int:
+        pass
+
+    @abstractmethod
+    def row_size(self, row: int) -> int:
+        pass
+
+    @abstractmethod
+    def project2d(self, ix: ix2d) -> Tuple[Union[float, int], Union[float, int]]:
+        pass
+
+    def indexes(self) -> Iterable[ix2d]:
+        for row in range(self.rows):
+            for col in range(self.row_size(row)):
+                yield row, col
+
+
+@dataclass(frozen=True)
+class RectangularLattice(Lattice2D):
+    height: int
+    width: int
+
+    def __post_init__(self):
+        assert self.height > 0, f'{self.height}'
+        assert self.width > 0, f'{self.width}'
+
+    @property
+    def dims(self) -> int:
+        return 2
+
+    @property
+    def size(self) -> int:
+        return self.height * self.width
+
+    @property
+    def rows(self) -> int:
+        return self.height
+
+    def row_size(self, row: int) -> int:
+        return self.height
+
+    def project2d(self, ix: ix2d) -> Tuple[int, int]:
+        return ix
+
+
+@dataclass(frozen=True)
+class HexagonalLattice(Lattice2D):
+    lateral_size: int
+
+    def __post_init__(self):
+        assert self.lateral_size > 0, f'{self.lateral_size}'
+        assert self.lateral_size % 2 == 1, f'{self.lateral_size}'
+
+    @property
+    def dims(self) -> int:
+        return 3
+
+    @property
+    def size(self) -> int:
+        return sum(self.row_size(row) for row in range(self.lateral_size))
+
+    @property
+    def rows(self) -> int:
+        return self.lateral_size
+
+    def row_size(self, row: int) -> int:
+        assert 0 <= row < self.lateral_size, f'{row} for {self!r}'
+        return self.lateral_size // 2 + min(row + 1, self.lateral_size - row)
+
+    def project2d(self, ix: ix2d) -> Tuple[float, float]:
+        row, col = ix
+        x = col + (self.lateral_size - self.row_size(row)) / 2.0
+        y = float(row)
+        return x, y
+
+
+class CubicLattice(Lattice):
+    @property
+    def dims(self) -> int:
+        return 3
+
+
 class ReChr(ABC):
     pass
+
 
 @dataclass(frozen=True)
 class ChrSeq(Sequence[ReChr]):
@@ -238,9 +346,6 @@ class Re(ABC):
     @classmethod
     def from_op_arg(cls, op: int, arg: Any, groups: Mapping[int, 'Re']) -> 'Re':
         return cls.op_converters[op](op, arg, groups)
-
-
-
 
 
 class ReAny(Re, ReChr):
@@ -551,9 +656,6 @@ class String:
         return self.pattern.re.gen_possible(self.size, self.size, empty_state)
 
 
-cell_ix_type = Tuple[int, int]
-
-
 @dataclass()
 class Cell:
     row: int
@@ -561,7 +663,7 @@ class Cell:
     positions: List[Position]
 
     @property
-    def index(self) -> cell_ix_type:
+    def index(self) -> ix2d:
         return self.row, self.col
 
     def __repr__(self) -> str:
@@ -815,7 +917,7 @@ all_literal_constraint = LiteralConstraint(frozenset([]), True)
 
 @dataclass(frozen=True, repr=False)
 class RefConstraint(Constraint):
-    indices: FrozenSet[cell_ix_type]
+    indices: FrozenSet[ix2d]
 
     def intersection(self, other: Constraint) -> Constraint:
         if other is any_constraint:
@@ -901,25 +1003,25 @@ class CompoundConstraint(Constraint):
 
 
 @dataclass(frozen=True, repr=False)
-class Solution(Mapping[cell_ix_type, Constraint]):
-    cells: FrozenDict[cell_ix_type, Constraint]
+class Solution(Mapping[ix2d, Constraint]):
+    cells: FrozenDict[ix2d, Constraint]
 
-    def __init__(self, cells: Mapping[cell_ix_type, Constraint]):
+    def __init__(self, cells: Mapping[ix2d, Constraint]):
         object.__setattr__(self, 'cells', FrozenDict(cells))
 
-    def __getitem__(self, k: cell_ix_type) -> Constraint:
+    def __getitem__(self, k: ix2d) -> Constraint:
         return self.cells[k]
 
     def __len__(self) -> int:
         return len(self.cells)
 
-    def __iter__(self) -> Iterator[cell_ix_type]:
+    def __iter__(self) -> Iterator[ix2d]:
         return iter(self.cells)
 
     @classmethod
     def for_chr_seq(cls, string: String, chr_seq: ChrSeq) -> 'Solution':
         assert string.size == len(chr_seq)
-        cells: Dict[cell_ix_type, Constraint] = {}
+        cells: Dict[ix2d, Constraint] = {}
         for i, position in enumerate(string.positions):
             assert position.index == i
             ix = position.cell.index
@@ -969,7 +1071,7 @@ class Solution(Mapping[cell_ix_type, Constraint]):
                 return None
             cells[ix] = c
 
-        def add_unique(ixs: FrozenSet[cell_ix_type], source: Dict[cell_ix_type, Constraint]):
+        def add_unique(ixs: FrozenSet[ix2d], source: Dict[ix2d, Constraint]):
             for ix in ixs - ixs_both:
                 cells[ix] = source[ix]
 
@@ -977,7 +1079,7 @@ class Solution(Mapping[cell_ix_type, Constraint]):
         add_unique(ixs_o, other.cells)
 
         @lru_cache(100)
-        def resolve_compound(cell_ix: cell_ix_type) -> Optional[CompoundConstraint]:
+        def resolve_compound(cell_ix: ix2d) -> Optional[CompoundConstraint]:
             cc = cells[cell_ix]
             acc = cc
             for ref_ix in cc.ref_component.indices:
@@ -1369,14 +1471,14 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
     def has_references(self) -> bool:
         return any(c.has_references for c, _ in self.constraint_dimensions)
 
-    def references(self) -> Set[cell_ix_type]:
+    def references(self) -> Set[ix2d]:
         refs = set()
         for c, _ in self.constraint_dimensions:
             if c.has_references:
                 refs.update(c.ref_component.indices)
         return refs
 
-    def apply_references(self, cells: Mapping[cell_ix_type, 'CellConstraints']) -> Optional['CellConstraints']:
+    def apply_references(self, cells: Mapping[ix2d, 'CellConstraints']) -> Optional['CellConstraints']:
         applied = ConstraintDimensionCombination()
         for con, comb in self.constraint_dimensions:
             if not con.has_references:
@@ -1397,7 +1499,7 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
         return None if not applied else CellConstraints(applied.items())
 
     @staticmethod
-    def resolve_references(cells: Mapping[cell_ix_type, 'CellConstraints'],
+    def resolve_references(cells: Mapping[ix2d, 'CellConstraints'],
                            comb: DimensionCombination,
                            ref_con: RefConstraint,
                            lit_con: Optional[LiteralConstraint]) -> ConstraintDimensionCombination:
@@ -1461,10 +1563,10 @@ class CellConstraints(Collection[Tuple[Constraint, DimensionCombination]]):
 
 class SparseSolutionSet:
     dimensions: FrozenSet[Dimension]
-    cells: Mapping[cell_ix_type, CellConstraints]
+    cells: Mapping[ix2d, CellConstraints]
 
     def __init__(self, dimensions: FrozenSet[Dimension],
-                 cells: Mapping[cell_ix_type, CellConstraints]) -> None:
+                 cells: Mapping[ix2d, CellConstraints]) -> None:
         self.dimensions = dimensions
         self.cells = cells
 
@@ -1481,7 +1583,7 @@ class SparseSolutionSet:
         if other.contains(self):
             return other
 
-        cells: Dict[cell_ix_type, CellConstraints] = {}
+        cells: Dict[ix2d, CellConstraints] = {}
         common = self.cells.keys() & other.cells.keys()
         for ix in common:
             c = self.cells[ix].intersection(other.cells[ix])
@@ -1501,7 +1603,7 @@ class SparseSolutionSet:
         cells = dict(self.cells)
 
         @lru_cache(len(cells))
-        def apply_constraints(cell_ix: cell_ix_type) -> Optional[CellConstraints]:
+        def apply_constraints(cell_ix: ix2d) -> Optional[CellConstraints]:
             cc = cells[cell_ix]
             assert cc.has_references
             for ref in cc.references():
@@ -1548,7 +1650,7 @@ class SparseSolutionSet:
     @classmethod
     def for_string(cls, s: String) -> Tuple['SparseSolutionSet', Sequence[Solution]]:
         solutions = list(Solution.generate_solutions(s))
-        cells: Dict[cell_ix_type, Dict[Constraint, List[int]]] = defaultdict(lambda: defaultdict(list))
+        cells: Dict[ix2d, Dict[Constraint, List[int]]] = defaultdict(lambda: defaultdict(list))
         for sol_i, solution in enumerate(solutions):
             for ix, con in solution.cells.items():
                 cells[ix][con].append(sol_i)
